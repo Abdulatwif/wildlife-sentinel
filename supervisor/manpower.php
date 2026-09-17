@@ -1,4 +1,4 @@
-<?php
+﻿<?php
 // ============================================================
 // supervisor/manpower.php
 // Zone Supervisor — Ranger Manpower Requests Review
@@ -168,7 +168,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['action'])) {
 // ------------------------------------------------------------
 // Correct columns: messages.subject, messages.content, messages.severity
 // (was using these same names but the display was inconsistent).
-// If your schema uses `description` instead of `content`, swap below.
+// If your schema uses "description" instead of "content", swap below.
 // ============================================================
 $requests = safeFetchAll($pdo, "
     SELECT m.*,
@@ -205,7 +205,7 @@ $requestsToday    = safeCount($pdo, "
     SELECT COUNT(*) as count FROM messages m
     LEFT JOIN users s ON m.sender_id = s.id
     WHERE m.message_type = 'manpower_request'
-      AND DATE(m.created_at) = CURDATE()
+      AND DATE(m.created_at) = CURRENT_DATE
       AND (m.zone_id = ? OR (m.zone_id IS NULL AND s.zone_id = ?))
 ", [$activeZoneId, $activeZoneId]);
 

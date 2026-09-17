@@ -1,4 +1,4 @@
-<?php
+﻿<?php
 // ============================================================
 // ranger/dashboard.php
 // Wildlife Sentinel — Ranger Dashboard

@@ -1,4 +1,4 @@
-<?php
+﻿<?php
 // ============================================================
 // admin/register-zone.php
 // Wildlife Sentinel — Zone Registration + Supervisor Management
@@ -193,7 +193,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['action'])) {
                 $hash = hashPassword($supPassword);
                 $stmt = $pdo->prepare("
                     INSERT INTO users (email, phone, password_hash, full_name, role, zone_id, created_by, is_active)
-                    VALUES (?, ?, ?, ?, 'zone_supervisor', ?, ?, 1)
+                    VALUES (?, ?, ?, ?, 'zone_supervisor', ?, ?, 1) RETURNING id
                 ");
                 $stmt->execute([
                     $supEmail,
@@ -204,14 +204,14 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['action'])) {
                     $user['id']
                 ]);
 
-                $supervisorId = (int)$pdo->lastInsertId();
+                $supervisorId = (int)($stmt->fetch()['id'] ?? 0);
 
                 // Zone notification settings — respects global toggles
                 try {
                     $pdo->prepare("
                         INSERT INTO zone_notification_settings (zone_id, sms_enabled, alarm_enabled, ai_detection_enabled)
                         VALUES (?, ?, ?, ?)
-                        ON DUPLICATE KEY UPDATE zone_id = zone_id
+                        ON CONFLICT DO NOTHING
                     ")->execute([
                         $zoneId,
                         $setSmsEnabled ? 1 : 0,

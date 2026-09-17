@@ -1,4 +1,4 @@
-<?php
+﻿<?php
 // ============================================================
 // admin/cctv-cameras.php
 // Wildlife Sentinel — CCTV Camera Management (Admin)
@@ -151,13 +151,13 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['action'])) {
                             (zone_id, camera_name, camera_code, stream_url,
                              location_lat, location_lng, camera_type, resolution,
                              is_active, is_recording, created_at)
-                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, 1, 0, NOW())
+                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, 1, 0, NOW()) RETURNING id
                     ");
                     $stmt->execute([
                         $zoneId, $cameraName, $cameraCode ?: null, $streamUrl ?: null,
                         $lat, $lng, $cameraType, $resolution,
                     ]);
-                    $newId = (int)$pdo->lastInsertId();
+                    $newId = (int)($stmt->fetch()['id'] ?? 0);
                     logAudit($user['id'], 'create_camera', ['camera_id' => $newId, 'zone_id' => $zoneId]);
                     $message = "✅ Camera '{$cameraName}' added successfully.";
                 } catch (PDOException $e) {
@@ -343,7 +343,7 @@ if ($search !== '') {
 $cameras = safeFetchAll($pdo, "
     SELECT c.*, z.name AS zone_name, z.park_type,
            (SELECT COUNT(*) FROM ai_detections d
-             WHERE d.camera_id = c.id AND DATE(d.detected_at) = CURDATE()) AS detections_today
+             WHERE d.camera_id = c.id AND DATE(d.detected_at) = CURRENT_DATE) AS detections_today
     FROM cctv_cameras c
     JOIN zones z ON c.zone_id = z.id
     $where

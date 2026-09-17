@@ -1,4 +1,4 @@
-<?php
+﻿<?php
 header('Content-Type: application/json');
 require_once '../includes/functions.php';
 requireLogin();
@@ -84,7 +84,7 @@ try {
             
             $stmt = $pdo->prepare("
                 INSERT INTO users (email, phone, password_hash, full_name, role, zone_id, created_by)
-                VALUES (?, ?, ?, ?, ?, ?, ?)
+                VALUES (?, ?, ?, ?, ?, ?, ?) RETURNING id
             ");
             
             $stmt->execute([
@@ -97,7 +97,7 @@ try {
                 $user['id']
             ]);
             
-            $userId = $pdo->lastInsertId();
+            $userId = (int)($stmt->fetch()['id'] ?? 0);
             logAudit($user['id'], 'create_user', ['email' => $data['email'], 'role' => $data['role']]);
             
             echo json_encode([

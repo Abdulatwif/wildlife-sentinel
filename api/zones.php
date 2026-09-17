@@ -1,4 +1,4 @@
-<?php
+﻿<?php
 header('Content-Type: application/json');
 require_once '../includes/functions.php';
 requireLogin();
@@ -34,7 +34,7 @@ try {
             
             $stmt = $pdo->prepare("
                 INSERT INTO zones (name, description, center_lat, center_lng, boundary_geojson, created_by)
-                VALUES (?, ?, ?, ?, ?, ?)
+                VALUES (?, ?, ?, ?, ?, ?) RETURNING id
             ");
             
             $stmt->execute([
@@ -46,7 +46,7 @@ try {
                 $user['id']
             ]);
             
-            $zoneId = $pdo->lastInsertId();
+            $zoneId = (int)($stmt->fetch()['id'] ?? 0);
             logAudit($user['id'], 'create_zone', ['zone_name' => $data['name']]);
             
             echo json_encode([

@@ -1,4 +1,4 @@
-<?php
+﻿<?php
 // ============================================================
 // index.php
 // Wildlife Sentinel — Public Landing Page

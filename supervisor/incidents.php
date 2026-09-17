@@ -1,4 +1,4 @@
-<?php
+﻿<?php
 // ============================================================
 // supervisor/incidents.php
 // Zone Supervisor — Incidents & AI Alerts

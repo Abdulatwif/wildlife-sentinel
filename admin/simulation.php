@@ -1,4 +1,4 @@
-<?php
+﻿<?php
 // ============================================================
 // admin/simulation.php
 // Wildlife Sentinel — Simulation Controls (Admin)
@@ -88,23 +88,23 @@ $historyLimit = $itemsPerPage;
 try {
     $pdo->exec("
         CREATE TABLE IF NOT EXISTS simulation_controls (
-            id INT(11) AUTO_INCREMENT PRIMARY KEY,
-            zone_id INT(11) NULL,
+            id SERIAL PRIMARY KEY,
+            zone_id INT NULL,
             name VARCHAR(255) NOT NULL,
             description TEXT NULL,
             simulation_type ENUM('incident','ai_detection','alarm','sms','ranger_movement') NOT NULL,
-            is_enabled TINYINT(1) DEFAULT 0,
+            is_enabled BOOLEAN DEFAULT FALSE,
             parameters JSON NULL,
-            started_at DATETIME NULL,
-            stopped_at DATETIME NULL,
-            created_by INT(11) NULL,
-            created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+            started_at TIMESTAMP NULL,
+            stopped_at TIMESTAMP NULL,
+            created_by INT NULL,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
             INDEX idx_zone (zone_id),
             INDEX idx_enabled (is_enabled),
             FOREIGN KEY (zone_id) REFERENCES zones(id) ON DELETE CASCADE,
             FOREIGN KEY (created_by) REFERENCES users(id) ON DELETE SET NULL
-        ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
-    ");
+        );
+
 } catch (PDOException $e) {
     error_log('[WS-SIM] create table: ' . $e->getMessage());
 }
@@ -205,7 +205,7 @@ if (!function_exists('runSimulation')) {
                         (reporter_id, reporter_type, zone_id, category, severity,
                          description, location_lat, location_lng, location_geojson,
                          status, reported_at, is_simulated)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ST_GeomFromText(?), 'reported', NOW(), 1)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'reported', NOW(), 1) RETURNING id
                 ");
                 $stmt->execute([
                     $reporterId, $reporterType, $zoneId, $category, $severity,
@@ -219,7 +219,7 @@ if (!function_exists('runSimulation')) {
                             (reporter_id, reporter_type, zone_id, category, severity,
                              description, location_lat, location_lng,
                              status, reported_at)
-                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'reported', NOW())
+                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'reported', NOW()) RETURNING id
                     ");
                     $stmt->execute([
                         $reporterId, $reporterType, $zoneId, $category, $severity,
@@ -229,7 +229,7 @@ if (!function_exists('runSimulation')) {
                     return ['success' => false, 'error' => 'Incident insert failed: ' . $e2->getMessage()];
                 }
             }
-            $incidentId = (int)$pdo->lastInsertId();
+            $incidentId = (int)($stmt->fetch()['id'] ?? 0);
 
             // Notify rangers (gated by notify_on_incident)
             $notified = 0; $suppressed = 0;
@@ -303,7 +303,7 @@ if (!function_exists('runSimulation')) {
                             (zone_id, camera_name, camera_code, camera_type, is_active, is_recording, created_at)
                         VALUES (?, ?, ?, 'fixed', 1, 1, NOW())
                     ")->execute([$zoneId, "[SIM] Virtual Camera", "SIM-" . time()]);
-                    $cameraId = (int)$pdo->lastInsertId();
+                    $cameraId = (int)($stmt->fetch()['id'] ?? 0);
                 } catch (PDOException $e) {
                     return ['success' => false, 'error' => 'No camera available and could not create virtual one'];
                 }
@@ -318,13 +318,13 @@ if (!function_exists('runSimulation')) {
                 INSERT INTO ai_detections
                     (camera_id, zone_id, detection_type, confidence, is_threat, threat_level,
                      snapshot_url, location_lat, location_lng, detected_at)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, NOW())
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, NOW()) RETURNING id
             ");
             $stmt->execute([
                 $cameraId, $zoneId, $detType, $confidence, $isThreat ? 1 : 0, $threatLevel,
                 $snapshotUrl, $lat, $lng,
             ]);
-            $detectionId = (int)$pdo->lastInsertId();
+            $detectionId = (int)($stmt->fetch()['id'] ?? 0);
 
             // Alert created only if threat AND auto-create is on
             $alertId = null;
@@ -340,7 +340,7 @@ if (!function_exists('runSimulation')) {
                         INSERT INTO ai_alerts
                             (detection_id, zone_id, alert_type, severity, title, description,
                              location_lat, location_lng, is_acknowledged, created_at)
-                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, 0, NOW())
+                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, 0, NOW()) RETURNING id
                     ");
                     $stmt->execute([
                         $detectionId, $zoneId, $alertType, $threatLevel,
@@ -348,7 +348,7 @@ if (!function_exists('runSimulation')) {
                         "Simulated AI detection: {$detType} detected with " . round($confidence * 100) . "% confidence",
                         $lat, $lng,
                     ]);
-                    $alertId = (int)$pdo->lastInsertId();
+                    $alertId = (int)($stmt->fetch()['id'] ?? 0);
 
                     // Notify rangers + supervisors (gated by notify_on_ai_alert)
                     $notified = 0; $suppressed = 0;
@@ -382,7 +382,7 @@ if (!function_exists('runSimulation')) {
                                         (zone_id, alarm_name, alarm_type, is_active, trigger_count, created_at)
                                     VALUES (?, ?, 'siren', 1, 0, NOW())
                                 ")->execute([$zoneId, "[SIM] Auto Siren"]);
-                                $alarmId = (int)$pdo->lastInsertId();
+                                $alarmId = (int)($stmt->fetch()['id'] ?? 0);
                             }
 
                             $pdo->prepare("
@@ -444,7 +444,7 @@ if (!function_exists('runSimulation')) {
                             (zone_id, alarm_name, alarm_type, is_active, trigger_count, created_at)
                         VALUES (?, ?, 'siren', 1, 0, NOW())
                     ")->execute([$zoneId, "[SIM] Test Siren"]);
-                    $alarmId   = (int)$pdo->lastInsertId();
+                    $alarmId   = (int)($stmt->fetch()['id'] ?? 0);
                     $alarmName = "[SIM] Test Siren";
                 } catch (PDOException $e) {
                     return ['success' => false, 'error' => 'No alarm available and could not create virtual one'];
@@ -457,10 +457,10 @@ if (!function_exists('runSimulation')) {
             $stmt = $pdo->prepare("
                 INSERT INTO alarm_triggers
                     (alarm_id, zone_id, triggered_by, trigger_reason, triggered_at)
-                VALUES (?, ?, 'manual', ?, NOW())
+                VALUES (?, ?, 'manual', ?, NOW()) RETURNING id
             ");
             $stmt->execute([$alarmId, $zoneId, '[SIM] Manual test trigger']);
-            $triggerId = (int)$pdo->lastInsertId();
+            $triggerId = (int)($stmt->fetch()['id'] ?? 0);
 
             $pdo->prepare("
                 UPDATE alarm_systems
@@ -527,8 +527,7 @@ if (!function_exists('runSimulation')) {
                     INSERT INTO ranger_live_tracking
                         (ranger_id, current_lat, current_lng, heading, speed, last_update, is_offline)
                     VALUES (?, ?, ?, ?, ?, NOW(), 0)
-                    ON DUPLICATE KEY UPDATE
-                        current_lat = VALUES(current_lat),
+                    ON CONFLICT (current_lat) DO UPDATE SET current_lat = EXCLUDED.current_lat,
                         current_lng = VALUES(current_lng),
                         heading     = VALUES(heading),
                         speed       = VALUES(speed),
@@ -579,7 +578,7 @@ if (!function_exists('runSimulation')) {
                         (user_id, phone, message, message_type, status, created_at)
                     VALUES (?, ?, ?, 'test', 'sent', NOW())
                 ")->execute([$user['id'], $phone, $message]);
-                $smsId = (int)$pdo->lastInsertId();
+                $smsId = (int)($stmt->fetch()['id'] ?? 0);
             } catch (PDOException $e) {
                 return ['success' => false, 'error' => 'Could not insert SMS log: ' . $e->getMessage()];
             }

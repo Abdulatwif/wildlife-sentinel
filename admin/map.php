@@ -1,4 +1,4 @@
-<?php
+﻿<?php
 // ============================================================
 // admin/map.php
 // Wildlife Sentinel — Admin Live Map
@@ -242,7 +242,7 @@ $aiAnomalies = safeFetchAll($pdo, "
            u.full_name AS subject_name, u.role AS subject_role
     FROM ai_anomalies a
     LEFT JOIN users u ON (a.ranger_id = u.id OR a.scout_id = u.id)
-    WHERE a.detected_at >= DATE_SUB(NOW(), INTERVAL 24 HOUR)
+    WHERE a.detected_at >= NOW() - INTERVAL ' hours'
     ORDER BY a.detected_at DESC
     LIMIT 50
 ");

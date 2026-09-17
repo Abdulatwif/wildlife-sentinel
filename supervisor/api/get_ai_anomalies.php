@@ -1,4 +1,4 @@
-<?php
+﻿<?php
 require_once __DIR__ . '/../../config/database.php';
 $user = getCurrentUser();
 
@@ -13,7 +13,7 @@ $stmt = $pdo->prepare("
     SELECT a.*, u.full_name AS subject_name, u.role AS subject_role
     FROM ai_anomalies a
     LEFT JOIN users u ON (a.ranger_id = u.id OR a.scout_id = u.id)
-    WHERE a.zone_id = ? AND a.detected_at >= DATE_SUB(NOW(), INTERVAL 24 HOUR)
+    WHERE a.zone_id = ? AND a.detected_at >= NOW() - INTERVAL ' hours'
     ORDER BY a.detected_at DESC
     LIMIT 50
 ");

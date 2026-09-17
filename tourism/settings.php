@@ -1,4 +1,4 @@
-<?php
+﻿<?php
 // ============================================================
 // tourism/settings.php
 // Tourism / Lodge Operator — Personal Account Settings
@@ -46,23 +46,23 @@ if (!function_exists('safeFetchAll')) {
 try {
     $pdo->exec("
         CREATE TABLE IF NOT EXISTS user_preferences (
-            user_id INT(11) PRIMARY KEY,
+            user_id INT PRIMARY KEY,
             theme VARCHAR(20) DEFAULT 'light',
             language VARCHAR(10) DEFAULT 'en',
             timezone VARCHAR(50) DEFAULT 'Africa/Lusaka',
             date_format VARCHAR(50) DEFAULT 'M j, Y H:i',
             items_per_page INT DEFAULT 25,
-            email_notifications TINYINT(1) DEFAULT 1,
-            sms_notifications TINYINT(1) DEFAULT 1,
-            push_notifications TINYINT(1) DEFAULT 1,
-            notify_incident_updates TINYINT(1) DEFAULT 1,
-            notify_ranger_responses TINYINT(1) DEFAULT 1,
-            notify_safety_alerts TINYINT(1) DEFAULT 1,
+            email_notifications BOOLEAN DEFAULT TRUE,
+            sms_notifications BOOLEAN DEFAULT TRUE,
+            push_notifications BOOLEAN DEFAULT TRUE,
+            notify_incident_updates BOOLEAN DEFAULT TRUE,
+            notify_ranger_responses BOOLEAN DEFAULT TRUE,
+            notify_safety_alerts BOOLEAN DEFAULT TRUE,
             quiet_hours_start TIME DEFAULT NULL,
             quiet_hours_end TIME DEFAULT NULL,
-            updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
-        ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
-    ");
+            updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        );
+
 } catch (PDOException $e) {}
 
 // ============================================================
@@ -173,8 +173,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['action'])) {
                      notify_incident_updates, notify_ranger_responses, notify_safety_alerts,
                      quiet_hours_start, quiet_hours_end, updated_at)
                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NOW())
-                ON DUPLICATE KEY UPDATE
-                    theme = VALUES(theme),
+                ON CONFLICT (theme) DO UPDATE SET theme = EXCLUDED.theme,
                     language = VALUES(language),
                     timezone = VALUES(timezone),
                     items_per_page = VALUES(items_per_page),

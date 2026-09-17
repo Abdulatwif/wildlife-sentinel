@@ -1,4 +1,4 @@
-<?php
+﻿<?php
 // ============================================================
 // maintenance.php
 // Wildlife Sentinel — Maintenance landing page

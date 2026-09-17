@@ -1,4 +1,4 @@
-<?php
+﻿<?php
 /**
  * Wildlife Sentinel — Alarm Control System (v3.1)
  * ------------------------------------------------------------
@@ -112,42 +112,42 @@ class AlarmControl
             ['alarm_systems',   'api_endpoint',              "VARCHAR(500) NULL"],
             ['alarm_systems',   'api_key',                   "VARCHAR(255) NULL"],
             ['alarm_systems',   'trigger_duration',          "INT DEFAULT 60"],
-            ['alarm_systems',   'auto_trigger',              "TINYINT(1) DEFAULT 1"],
+            ['alarm_systems',   'auto_trigger',              "BOOLEAN DEFAULT TRUE"],
             ['alarm_systems',   'max_acknowledge_time_seconds', "INT DEFAULT 120"],
             ['alarm_systems',   'sound_url',                 "VARCHAR(500) NULL"],
             ['alarm_systems',   'sound_volume',              "INT DEFAULT 80"],
             ['alarm_systems',   'siren_duration',            "INT DEFAULT 180"],
             ['alarm_systems',   'trigger_delay_seconds',     "INT DEFAULT 120"],
-            ['alarm_systems',   'auto_sound_on_incident',    "TINYINT(1) DEFAULT 1"],
+            ['alarm_systems',   'auto_sound_on_incident',    "BOOLEAN DEFAULT TRUE"],
 
             ['alarm_triggers',  'alert_id',                  "INT NULL"],
             ['alarm_triggers',  'incident_id',               "INT NULL"],
             ['alarm_triggers',  'triggered_by',              "VARCHAR(40) DEFAULT 'ai_detection'"],
             ['alarm_triggers',  'trigger_reason',            "VARCHAR(255) NULL"],
-            ['alarm_triggers',  'triggered_at',              "DATETIME DEFAULT CURRENT_TIMESTAMP"],
-            ['alarm_triggers',  'stopped_at',                "DATETIME NULL"],
+            ['alarm_triggers',  'triggered_at',              "TIMESTAMP DEFAULT CURRENT_TIMESTAMP"],
+            ['alarm_triggers',  'stopped_at',                "TIMESTAMP NULL"],
             ['alarm_triggers',  'duration_seconds',          "INT NULL"],
-            ['alarm_triggers',  'was_acknowledged',          "TINYINT(1) DEFAULT 0"],
+            ['alarm_triggers',  'was_acknowledged',          "BOOLEAN DEFAULT FALSE"],
             ['alarm_triggers',  'acknowledged_by',           "INT NULL"],
-            ['alarm_triggers',  'acknowledged_at',           "DATETIME NULL"],
+            ['alarm_triggers',  'acknowledged_at',           "TIMESTAMP NULL"],
         ];
 
         try {
-            $cursor = $this->pdo->query("SELECT DATABASE() AS db");
+            $cursor = $this->pdo->query("SELECT current_database() AS db");
             $db = $cursor->fetch()['db'] ?? null;
             if (!$db) return;
 
             foreach ($wanted as [$table, $column, $ddl]) {
                 $stmt = $this->pdo->prepare("
                     SELECT COUNT(*) AS c
-                    FROM INFORMATION_SCHEMA.COLUMNS
-                    WHERE TABLE_SCHEMA = ? AND TABLE_NAME = ? AND COLUMN_NAME = ?
+                    FROM information_schema.columns
+                    WHERE table_schema = 'public' AND table_name = ? AND column_name = ?
                 ");
-                $stmt->execute([$db, $table, $column]);
+                $stmt->execute([$table, $column]);
                 $exists = (int)($stmt->fetch()['c'] ?? 0);
                 if (!$exists) {
                     try {
-                        $this->pdo->exec("ALTER TABLE `{$table}` ADD COLUMN `{$column}` {$ddl}");
+                        $this->pdo->exec("ALTER TABLE \"{$table}\" ADD COLUMN IF NOT EXISTS \"{$column}\" {$ddl}");
                         alarm_log('info', "Schema: added {$table}.{$column}");
                     } catch (PDOException $e) {
                         alarm_log('warning', "Schema add skipped", [
@@ -215,7 +215,7 @@ class AlarmControl
                 INSERT INTO alarm_triggers (
                     zone_id, incident_id, triggered_by, trigger_reason,
                     triggered_at, was_acknowledged
-                ) VALUES (?, ?, 'unacknowledged_incident', ?, DATE_ADD(NOW(), INTERVAL ? SECOND), 0)
+                ) VALUES (?, ?, 'unacknowledged_incident', ?, NOW() + (? || ' seconds')::INTERVAL, 0) RETURNING id
             ");
             $stmt->execute([
                 $zoneId,
@@ -259,7 +259,7 @@ class AlarmControl
                 FROM incidents i
                 LEFT JOIN zone_notification_settings zns ON i.zone_id = zns.zone_id
                 WHERE i.status = 'reported'
-                  AND i.reported_at < DATE_SUB(NOW(), INTERVAL COALESCE(zns.alarm_delay_seconds, 120) SECOND)
+                  AND i.reported_at < NOW() - (COALESCE(zns.alarm_delay_seconds, 120) || ' seconds')::INTERVAL
                   AND COALESCE(zns.alarm_enabled, 1) = 1
                   AND NOT EXISTS (
                       SELECT 1 FROM alarm_triggers at
@@ -326,7 +326,7 @@ class AlarmControl
                 $stmt = $this->pdo->prepare("
                     INSERT INTO alarm_triggers (
                         alarm_id, incident_id, zone_id, triggered_by, trigger_reason, triggered_at
-                    ) VALUES (?, ?, ?, 'unacknowledged_incident', ?, NOW())
+                    ) VALUES (?, ?, ?, 'unacknowledged_incident', ?, NOW()) RETURNING id
                 ");
                 $stmt->execute([
                     $alarm['id'],
@@ -386,7 +386,7 @@ class AlarmControl
                 SELECT COUNT(*) AS c
                 FROM alarm_triggers
                 WHERE incident_id = ? AND alarm_id = ?
-                  AND triggered_at >= DATE_SUB(NOW(), INTERVAL ? SECOND)
+                  AND triggered_at >= NOW() - (? || ' seconds')::INTERVAL
             ");
             $stmt->execute([$incidentId, $alarmId, $cooldown]);
             return ((int)($stmt->fetch()['c'] ?? 0)) > 0;
@@ -512,7 +512,7 @@ class AlarmControl
                 $this->pdo->prepare("
                     UPDATE alarm_triggers
                     SET stopped_at = NOW(),
-                        duration_seconds = TIMESTAMPDIFF(SECOND, triggered_at, NOW()),
+                        duration_seconds = EXTRACT(EPOCH FROM NOW() - triggered_at)::INT,
                         was_acknowledged = 1,
                         acknowledged_by = ?,
                         acknowledged_at = NOW()
@@ -605,7 +605,7 @@ class AlarmControl
             try {
                 $stmt = $this->pdo->prepare("
                     INSERT INTO alarm_triggers (alarm_id, zone_id, triggered_by, trigger_reason, triggered_at)
-                    VALUES (?, ?, 'scheduled_test', ?, NOW())
+                    VALUES (?, ?, 'scheduled_test', ?, NOW()) RETURNING id
                 ");
                 $stmt->execute([$alarm['id'], $zoneId, "Manual test by user #{$userId}"]);
             } catch (PDOException $e) {

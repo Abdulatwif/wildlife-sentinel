@@ -1,4 +1,4 @@
-<?php
+﻿<?php
 // ============================================================
 // forgot-password.php
 // Wildlife Sentinel — Password Reset (Step 1 of 2)
@@ -6,7 +6,7 @@
 // Flow:
 //   1. User enters their email → POST here
 //   2. If email matches an active user, a reset token is
-//      created, stored (hashed) in `password_resets`, and the
+//      created, stored (hashed) in "password_resets", and the
 //      user receives a link to reset-password.php?token=...
 //   3. If email does NOT match, we still show the same success
 //      message (prevents user enumeration).
@@ -74,20 +74,20 @@ try {
     $pdo = getDB();
     $pdo->exec("
         CREATE TABLE IF NOT EXISTS password_resets (
-            id INT(11) AUTO_INCREMENT PRIMARY KEY,
-            user_id INT(11) NOT NULL,
+            id SERIAL PRIMARY KEY,
+            user_id INT NOT NULL,
             email VARCHAR(150) NOT NULL,
             token_hash VARCHAR(255) NOT NULL,
             ip_address VARCHAR(45) NULL,
             user_agent VARCHAR(255) NULL,
-            created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
-            expires_at DATETIME NOT NULL,
-            used_at DATETIME NULL,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            expires_at TIMESTAMP NOT NULL,
+            used_at TIMESTAMP NULL,
             INDEX idx_token (token_hash),
             INDEX idx_user (user_id),
             INDEX idx_expires (expires_at)
-        ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
-    ");
+        );
+
 } catch (PDOException $e) {
     error_log('[WS-FORGOT] create table: ' . $e->getMessage());
 }
@@ -209,7 +209,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                     $ins = $pdo->prepare("
                         INSERT INTO password_resets
                             (user_id, email, token_hash, ip_address, user_agent, created_at, expires_at)
-                        VALUES (?, ?, ?, ?, ?, NOW(), ?)
+                        VALUES (?, ?, ?, ?, ?, NOW(), ?) RETURNING id
                     ");
                     $ins->execute([
                         (int)$user['id'],

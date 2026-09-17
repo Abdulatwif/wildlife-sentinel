@@ -1,4 +1,4 @@
-<?php
+﻿<?php
 // ============================================================
 // supervisor/cctv-cameras.php
 // Zone Supervisor — CCTV Camera Management (zone-scoped)
@@ -100,8 +100,8 @@ if (!function_exists('ws_cam_sanitize_dir')) {
 try {
     $pdo->exec("
         CREATE TABLE IF NOT EXISTS cctv_cameras (
-            id INT(11) AUTO_INCREMENT PRIMARY KEY,
-            zone_id INT(11) NOT NULL,
+            id SERIAL PRIMARY KEY,
+            zone_id INT NOT NULL,
             camera_name VARCHAR(255) NOT NULL,
             camera_code VARCHAR(50) NULL,
             stream_url VARCHAR(500) NULL,
@@ -109,12 +109,12 @@ try {
             location_lng DECIMAL(11,8) NULL,
             camera_type ENUM('fixed','ptz','thermal','drone') DEFAULT 'fixed',
             resolution VARCHAR(20) DEFAULT '1080p',
-            is_active TINYINT(1) DEFAULT 1,
-            is_recording TINYINT(1) DEFAULT 0,
-            last_seen DATETIME NULL,
-            created_at DATETIME DEFAULT CURRENT_TIMESTAMP
-        ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
-    ");
+            is_active BOOLEAN DEFAULT TRUE,
+            is_recording BOOLEAN DEFAULT FALSE,
+            last_seen TIMESTAMP NULL,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        );
+
 } catch (PDOException $e) { /* ignore */ }
 
 // ============================================================
@@ -308,7 +308,7 @@ if ($search !== '') {
 $cameras = safeFetchAll($pdo, "
     SELECT c.*, z.name AS zone_name,
            (SELECT COUNT(*) FROM ai_detections d
-             WHERE d.camera_id = c.id AND DATE(d.detected_at) = CURDATE()) AS detections_today
+             WHERE d.camera_id = c.id AND DATE(d.detected_at) = CURRENT_DATE) AS detections_today
     FROM cctv_cameras c
     LEFT JOIN zones z ON c.zone_id = z.id
     $where

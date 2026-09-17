@@ -1,4 +1,4 @@
-<?php
+﻿<?php
 // ============================================================
 // api/ai-ingest.php
 // Fast ingest endpoint — accepts detection events and runs

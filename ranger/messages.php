@@ -1,4 +1,4 @@
-<?php
+﻿<?php
 require_once '../includes/functions.php';
 requireLogin();
 
@@ -36,11 +36,11 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['action'])) {
                 
                 $stmt = $pdo->prepare("
                     INSERT INTO messages (sender_id, recipient_id, incident_id, message_type, subject, content, is_broadcast, created_at)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, NOW())
+                    VALUES (?, ?, ?, ?, ?, ?, ?, NOW()) RETURNING id
                 ");
                 
                 if ($stmt->execute([$user['id'], $recipientId, $incidentId, $messageType, $subject, $content, $isBroadcast])) {
-                    $messageId = $pdo->lastInsertId();
+                    $messageId = (int)($stmt->fetch()['id'] ?? 0);
                     
                     if ($recipientId) {
                         createNotification($recipientId, 'new_message', '💬 New Message',
@@ -75,11 +75,11 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['action'])) {
         } else {
             $stmt = $pdo->prepare("
                 INSERT INTO messages (sender_id, recipient_id, message_type, content, parent_message_id, created_at)
-                VALUES (?, ?, 'general', ?, ?, NOW())
+                VALUES (?, ?, 'general', ?, ?, NOW()) RETURNING id
             ");
             
             if ($stmt->execute([$user['id'], $recipientId, $content, $parentMessageId])) {
-                $messageId = $pdo->lastInsertId();
+                $messageId = (int)($stmt->fetch()['id'] ?? 0);
                 createNotification($recipientId, 'new_message', '💬 Reply Received',
                     "Reply from {$user['full_name']}: " . substr($content, 0, 50), null, $messageId);
                 logAudit($user['id'], 'reply_message', ['message_id' => $messageId]);

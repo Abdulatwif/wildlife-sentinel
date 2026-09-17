@@ -1,4 +1,4 @@
-<?php
+﻿<?php
 header('Content-Type: application/json');
 require_once '../includes/functions.php';
 requireLogin();
@@ -29,13 +29,7 @@ try {
             $stmt = $pdo->prepare("
                 INSERT INTO ranger_live_tracking (ranger_id, current_lat, current_lng, heading, speed, last_update, is_offline)
                 VALUES (?, ?, ?, ?, ?, NOW(), ?)
-                ON DUPLICATE KEY UPDATE 
-                    current_lat = ?, 
-                    current_lng = ?, 
-                    heading = ?, 
-                    speed = ?, 
-                    last_update = NOW(),
-                    is_offline = ?
+                ON CONFLICT DO NOTHING
             ");
             
             $isOffline = isset($data['is_offline']) ? 1 : 0;
@@ -132,7 +126,7 @@ try {
                   AND u.id != ?
                   AND ra.is_available = 1
                   AND rlt.current_lat IS NOT NULL
-                HAVING distance < ?
+                HAVING (6371 * acos(cos(radians(?)) * cos(radians(location_lat)) * cos(radians(location_lng) - radians(?)) + sin(radians(?)) * sin(radians(location_lat)))) < ?
                 ORDER BY distance ASC
             ");
             $stmt->execute([$lat, $lng, $lat, $user['id'], $radius]);

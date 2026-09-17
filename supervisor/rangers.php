@@ -1,4 +1,4 @@
-<?php
+﻿<?php
 require_once '../includes/functions.php';
 requireLogin();
 
@@ -67,7 +67,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['action'])) {
         $stmt = $pdo->prepare("
             INSERT INTO ranger_availability (ranger_id, is_available, last_status_update) 
             VALUES (?, ?, NOW()) 
-            ON DUPLICATE KEY UPDATE is_available = ?, last_status_update = NOW()
+            ON CONFLICT DO NOTHING
         ");
         $stmt->execute([$rangerId, $status, $status]);
         
@@ -83,7 +83,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['action'])) {
         if (!empty($message)) {
             $stmt = $pdo->prepare("
                 INSERT INTO messages (sender_id, recipient_id, message_type, content, created_at)
-                VALUES (?, ?, 'general', ?, NOW())
+                VALUES (?, ?, 'general', ?, NOW()) RETURNING id
             ");
             $stmt->execute([$user['id'], $rangerId, $message]);
             

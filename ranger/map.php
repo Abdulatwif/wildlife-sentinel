@@ -1,4 +1,4 @@
-<?php
+﻿<?php
 // ============================================================
 // ranger/map.php
 // Wildlife Sentinel — Ranger Live Map
@@ -82,7 +82,7 @@ $myLocation = $myTracking[0] ?? null;
 $myRoute = safeFetchAll($pdo, "
     SELECT lat, lng, heading, speed, timestamp
     FROM ranger_location_history
-    WHERE ranger_id = ? AND timestamp >= DATE_SUB(NOW(), INTERVAL 2 HOUR)
+    WHERE ranger_id = ? AND timestamp >= NOW() - INTERVAL ' hours'
     ORDER BY timestamp ASC
 ", [$user['id']]);
 

@@ -1,4 +1,4 @@
-<?php
+﻿<?php
 // ============================================================
 // supervisor/sms-gateway.php
 // Wildlife Sentinel — Zone Supervisor SMS Gateway
@@ -83,7 +83,7 @@ if (!function_exists('safeFetchAll')) {
 try {
     $pdo->exec("
         CREATE TABLE IF NOT EXISTS sms_messages (
-            id              INT AUTO_INCREMENT PRIMARY KEY,
+            id              INT  PRIMARY KEY,
             zone_id         INT NOT NULL,
             sender_id       INT NOT NULL,
             recipient_id    INT NULL,
@@ -96,16 +96,16 @@ try {
             provider_ref    VARCHAR(120) NULL,
             error_message   TEXT NULL,
             segments        TINYINT DEFAULT 1,
-            sent_at         DATETIME NULL,
-            delivered_at    DATETIME NULL,
-            created_at      DATETIME DEFAULT CURRENT_TIMESTAMP,
+            sent_at         TIMESTAMP NULL,
+            delivered_at    TIMESTAMP NULL,
+            created_at      TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
             INDEX idx_zone (zone_id),
             INDEX idx_sender (sender_id),
             INDEX idx_recipient (recipient_id),
             INDEX idx_status (status),
             INDEX idx_created (created_at)
-        ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
-    ");
+        );
+
 } catch (PDOException $e) { /* ignore */ }
 
 // ============================================================
@@ -431,14 +431,14 @@ if (!function_exists('withinRateLimit')) {
     function withinRateLimit(PDO $pdo, int $senderId, string $recipientPhone): array {
         $sentLastHour = safeCount($pdo, "
             SELECT COUNT(*) as count FROM sms_messages
-            WHERE sender_id = ? AND created_at >= DATE_SUB(NOW(), INTERVAL 1 HOUR)
+            WHERE sender_id = ? AND created_at >= NOW() - INTERVAL ' hours'
         ", [$senderId]);
         if ($sentLastHour >= SMS_RATE_PER_HOUR_PER_SUPERVISOR) {
             return [false, 'Rate limit: max ' . SMS_RATE_PER_HOUR_PER_SUPERVISOR . ' SMS/hour.'];
         }
         $sentToRecipientToday = safeCount($pdo, "
             SELECT COUNT(*) as count FROM sms_messages
-            WHERE recipient_phone = ? AND created_at >= DATE_SUB(NOW(), INTERVAL 1 DAY)
+            WHERE recipient_phone = ? AND created_at >= NOW() - INTERVAL ' days'
         ", [$recipientPhone]);
         if ($sentToRecipientToday >= SMS_RATE_PER_DAY_PER_RECIPIENT) {
             return [false, 'Recipient already got ' . SMS_RATE_PER_DAY_PER_RECIPIENT . ' SMS in 24h.'];
@@ -524,7 +524,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['action'])) {
                                  message, template_key, status, provider, provider_ref,
                                  error_message, segments, sent_at, created_at)
                             VALUES
-                                (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NOW(), NOW())
+                                (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NOW(), NOW()) RETURNING id
                         ");
                         $stmt->execute([
                             $activeZoneId, $user['id'], $r['id'] ?? null,
@@ -621,9 +621,9 @@ $recentMessages = safeFetchAll($pdo, "
 ", [$activeZoneId]);
 
 $stats = [
-    'sent_today'   => safeCount($pdo, "SELECT COUNT(*) as count FROM sms_messages WHERE zone_id = ? AND status IN ('sent','delivered') AND created_at >= CURDATE()", [$activeZoneId]),
-    'failed_today' => safeCount($pdo, "SELECT COUNT(*) as count FROM sms_messages WHERE zone_id = ? AND status = 'failed' AND created_at >= CURDATE()", [$activeZoneId]),
-    'sent_week'    => safeCount($pdo, "SELECT COUNT(*) as count FROM sms_messages WHERE zone_id = ? AND status IN ('sent','delivered') AND created_at >= DATE_SUB(NOW(), INTERVAL 7 DAY)", [$activeZoneId]),
+    'sent_today'   => safeCount($pdo, "SELECT COUNT(*) as count FROM sms_messages WHERE zone_id = ? AND status IN ('sent','delivered') AND created_at >= CURRENT_DATE", [$activeZoneId]),
+    'failed_today' => safeCount($pdo, "SELECT COUNT(*) as count FROM sms_messages WHERE zone_id = ? AND status = 'failed' AND created_at >= CURRENT_DATE", [$activeZoneId]),
+    'sent_week'    => safeCount($pdo, "SELECT COUNT(*) as count FROM sms_messages WHERE zone_id = ? AND status IN ('sent','delivered') AND created_at >= NOW() - INTERVAL ' days'", [$activeZoneId]),
     'recipients'   => count($zoneUsers),
 ];
 
@@ -632,7 +632,7 @@ $weeklyCounts = [];
 $rows = safeFetchAll($pdo, "
     SELECT DATE(created_at) AS d, COUNT(*) AS c
     FROM sms_messages
-    WHERE zone_id = ? AND created_at >= DATE_SUB(CURDATE(), INTERVAL 6 DAY)
+    WHERE zone_id = ? AND created_at >= DATE_SUB(CURRENT_DATE, INTERVAL 6 DAY)
     GROUP BY DATE(created_at)
 ", [$activeZoneId]);
 $byDate = [];

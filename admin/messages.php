@@ -1,4 +1,4 @@
-<?php
+﻿<?php
 require_once '../includes/functions.php';
 requireLogin();
 
@@ -34,11 +34,11 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['action'])) {
                     INSERT INTO messages (
                         sender_id, recipient_id, incident_id, message_type, 
                         subject, content, is_broadcast, parent_message_id, created_at
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, NOW())
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, NOW()) RETURNING id
                 ");
                 
                 if ($stmt->execute([$user['id'], $recipientId, $incidentId, $messageType, $subject, $content, $isBroadcast, $parentMessageId])) {
-                    $messageId = $pdo->lastInsertId();
+                    $messageId = (int)($stmt->fetch()['id'] ?? 0);
                     
                     if ($recipientId) {
                         createNotification(
@@ -84,11 +84,11 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['action'])) {
                     INSERT INTO messages (
                         sender_id, recipient_id, message_type, 
                         content, parent_message_id, created_at
-                    ) VALUES (?, ?, 'general', ?, ?, NOW())
+                    ) VALUES (?, ?, 'general', ?, ?, NOW()) RETURNING id
                 ");
                 
                 if ($stmt->execute([$user['id'], $recipientId, $content, $parentMessageId])) {
-                    $messageId = $pdo->lastInsertId();
+                    $messageId = (int)($stmt->fetch()['id'] ?? 0);
                     
                     createNotification(
                         $recipientId, 'new_message', '💬 Reply Received',

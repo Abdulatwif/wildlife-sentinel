@@ -1,4 +1,4 @@
-<?php
+﻿<?php
 header('Content-Type: application/json');
 require_once '../includes/functions.php';
 requireLogin();
@@ -26,7 +26,7 @@ try {
                 INSERT INTO messages (
                     sender_id, recipient_id, incident_id, message_type,
                     subject, content, is_broadcast, created_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, NOW())
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, NOW()) RETURNING id
             ");
             
             $stmt->execute([
@@ -39,7 +39,7 @@ try {
                 $isBroadcast
             ]);
             
-            $messageId = $pdo->lastInsertId();
+            $messageId = (int)($stmt->fetch()['id'] ?? 0);
             
             // Notify recipient
             if ($recipientId) {

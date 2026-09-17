@@ -1,4 +1,4 @@
-<?php
+﻿<?php
 require_once '../includes/functions.php';
 requireSupervisor();
 
@@ -258,7 +258,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
             $hash = hashPassword($password);
             $stmt = $pdo->prepare("
                 INSERT INTO users (email, phone, password_hash, full_name, role, zone_id, created_by)
-                VALUES (?, ?, ?, ?, ?, ?, ?)
+                VALUES (?, ?, ?, ?, ?, ?, ?) RETURNING id
             ");
             try {
                 $stmt->execute([$email, $phone ?: null, $hash, $fullName, $role, $zoneId ?: null, $user['id']]);

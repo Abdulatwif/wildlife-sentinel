@@ -1,4 +1,4 @@
-<?php
+﻿<?php
 // ============================================================
 // tourism/safety-map.php
 // Tourism / Lodge Operator — Safety Map (read-only)
@@ -77,7 +77,7 @@ $zoneCritical  = safeCount($pdo, "SELECT COUNT(*) as count FROM incidents WHERE 
 $zoneHigh      = safeCount($pdo, "SELECT COUNT(*) as count FROM incidents WHERE zone_id = ? AND severity = 'high' AND status NOT IN ('resolved','closed')", [$activeZoneId]);
 $zoneMedium    = safeCount($pdo, "SELECT COUNT(*) as count FROM incidents WHERE zone_id = ? AND severity = 'medium' AND status NOT IN ('resolved','closed')", [$activeZoneId]);
 $zoneLow       = safeCount($pdo, "SELECT COUNT(*) as count FROM incidents WHERE zone_id = ? AND severity = 'low' AND status NOT IN ('resolved','closed')", [$activeZoneId]);
-$zoneResolved7 = safeCount($pdo, "SELECT COUNT(*) as count FROM incidents WHERE zone_id = ? AND status = 'resolved' AND resolved_at >= DATE_SUB(NOW(), INTERVAL 7 DAY)", [$activeZoneId]);
+$zoneResolved7 = safeCount($pdo, "SELECT COUNT(*) as count FROM incidents WHERE zone_id = ? AND status = 'resolved' AND resolved_at >= NOW() - INTERVAL ' days'", [$activeZoneId]);
 
 // ============================================================
 // COMPUTE SAFETY LEVEL
@@ -110,7 +110,7 @@ if ($zoneCritical > 0) {
 
 // ============================================================
 // REGISTERED CAMPS / LODGES IN THIS ZONE (safe areas)
-// If you have a `lodges` table, this shows them; otherwise empty.
+// If you have a "lodges" table, this shows them; otherwise empty.
 // ============================================================
 $lodges = [];
 try {

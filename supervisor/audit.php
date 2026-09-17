@@ -1,4 +1,4 @@
-<?php
+﻿<?php
 // ============================================================
 // supervisor/audit.php
 // Zone Supervisor — Audit Log Viewer
@@ -67,15 +67,15 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['action'])) {
 
         switch ($scope) {
             case '24h':
-                $where .= " AND a.created_at >= DATE_SUB(NOW(), INTERVAL 24 HOUR) ";
+                $where .= " AND a.created_at >= NOW() - INTERVAL ' hours' ";
                 $label = 'last 24 hours';
                 break;
             case '7d':
-                $where .= " AND a.created_at >= DATE_SUB(NOW(), INTERVAL 7 DAY) ";
+                $where .= " AND a.created_at >= NOW() - INTERVAL ' days' ";
                 $label = 'last 7 days';
                 break;
             case '30d':
-                $where .= " AND a.created_at >= DATE_SUB(NOW(), INTERVAL 30 DAY) ";
+                $where .= " AND a.created_at >= NOW() - INTERVAL ' days' ";
                 $label = 'last 30 days';
                 break;
             case 'all':
@@ -279,9 +279,9 @@ $distinctActions = safeFetchAll($pdo, "
 // SUMMARY STATS
 // ============================================================
 $stats = [
-    '24h'  => safeCount($pdo, "SELECT COUNT(*) as count FROM audit_logs a LEFT JOIN users u ON a.user_id = u.id WHERE (u.zone_id = ? OR a.user_id = ?) AND a.created_at >= DATE_SUB(NOW(), INTERVAL 24 HOUR)", [$activeZoneId, $user['id']]),
-    '7d'   => safeCount($pdo, "SELECT COUNT(*) as count FROM audit_logs a LEFT JOIN users u ON a.user_id = u.id WHERE (u.zone_id = ? OR a.user_id = ?) AND a.created_at >= DATE_SUB(NOW(), INTERVAL 7 DAY)", [$activeZoneId, $user['id']]),
-    '30d'  => safeCount($pdo, "SELECT COUNT(*) as count FROM audit_logs a LEFT JOIN users u ON a.user_id = u.id WHERE (u.zone_id = ? OR a.user_id = ?) AND a.created_at >= DATE_SUB(NOW(), INTERVAL 30 DAY)", [$activeZoneId, $user['id']]),
+    '24h'  => safeCount($pdo, "SELECT COUNT(*) as count FROM audit_logs a LEFT JOIN users u ON a.user_id = u.id WHERE (u.zone_id = ? OR a.user_id = ?) AND a.created_at >= NOW() - INTERVAL ' hours'", [$activeZoneId, $user['id']]),
+    '7d'   => safeCount($pdo, "SELECT COUNT(*) as count FROM audit_logs a LEFT JOIN users u ON a.user_id = u.id WHERE (u.zone_id = ? OR a.user_id = ?) AND a.created_at >= NOW() - INTERVAL ' days'", [$activeZoneId, $user['id']]),
+    '30d'  => safeCount($pdo, "SELECT COUNT(*) as count FROM audit_logs a LEFT JOIN users u ON a.user_id = u.id WHERE (u.zone_id = ? OR a.user_id = ?) AND a.created_at >= NOW() - INTERVAL ' days'", [$activeZoneId, $user['id']]),
     'total'=> $totalLogs,
 ];
 

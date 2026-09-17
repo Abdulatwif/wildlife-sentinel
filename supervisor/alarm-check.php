@@ -1,4 +1,4 @@
-<?php
+﻿<?php
 // ============================================================
 // supervisor/alarm-check.php
 // Returns active alarms for the supervisor's zone (JSON)
@@ -44,7 +44,7 @@ foreach ($triggers as &$t) {
             $pdo->prepare("
                 UPDATE alarm_triggers SET
                     stopped_at = NOW(),
-                    duration_seconds = TIMESTAMPDIFF(SECOND, triggered_at, NOW())
+                    duration_seconds = EXTRACT(EPOCH FROM NOW() - )::INT
                 WHERE id = ?
             ")->execute([$t['id']]);
             $t['stopped'] = true;

@@ -1,4 +1,4 @@
-<?php
+﻿<?php
 // ============================================================
 // supervisor/ai-dashboard.php
 // Zone Supervisor — AI Detection Dashboard (zone-scoped)
@@ -108,12 +108,12 @@ try {
     $pdo->exec("
         CREATE TABLE IF NOT EXISTS zone_ai_settings (
             zone_id INT PRIMARY KEY,
-            sound_alerts_enabled TINYINT(1) DEFAULT 1,
-            auto_ack_low_risk TINYINT(1) DEFAULT 0,
+            sound_alerts_enabled BOOLEAN DEFAULT TRUE,
+            auto_ack_low_risk BOOLEAN DEFAULT FALSE,
             auto_ack_minutes INT DEFAULT 10,
-            updated_at DATETIME DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP
-        ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
-    ");
+            updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP
+        );
+
 } catch (PDOException $e) { /* non-fatal */ }
 
 // Load (or create) settings for this zone
@@ -148,10 +148,10 @@ $filterMinConf = isset($_GET['minconf'])
     : $confidenceFloorPct;
 
 $windowSql = [
-    '1h'  => 'DATE_SUB(NOW(), INTERVAL 1 HOUR)',
-    '24h' => 'DATE_SUB(NOW(), INTERVAL 24 HOUR)',
-    '7d'  => 'DATE_SUB(NOW(), INTERVAL 7 DAY)',
-][$filterWindow] ?? 'DATE_SUB(NOW(), INTERVAL 24 HOUR)';
+    '1h'  => 'NOW() - INTERVAL ' hours'',
+    '24h' => 'NOW() - INTERVAL ' hours'',
+    '7d'  => 'NOW() - INTERVAL ' days'',
+][$filterWindow] ?? 'NOW() - INTERVAL ' hours'';
 
 // ============================================================
 // AJAX ENDPOINTS — live poll + CSV export
@@ -205,8 +205,8 @@ if (isset($_GET['ajax'])) {
         $stats = [
             'pending_alerts'   => safeCount($pdo, "SELECT COUNT(*) as count FROM ai_alerts WHERE zone_id = ? AND is_acknowledged = 0", [$activeZoneId]),
             'active_alarms'    => safeCount($pdo, "SELECT COUNT(*) as count FROM alarm_triggers WHERE zone_id = ? AND stopped_at IS NULL", [$activeZoneId]),
-            'today_detections' => safeCount($pdo, "SELECT COUNT(*) as count FROM ai_detections WHERE zone_id = ? AND DATE(detected_at) = CURDATE()", [$activeZoneId]),
-            'today_threats'    => safeCount($pdo, "SELECT COUNT(*) as count FROM ai_detections WHERE zone_id = ? AND is_threat = 1 AND DATE(detected_at) = CURDATE()", [$activeZoneId]),
+            'today_detections' => safeCount($pdo, "SELECT COUNT(*) as count FROM ai_detections WHERE zone_id = ? AND DATE() = CURRENT_DATE", [$activeZoneId]),
+            'today_threats'    => safeCount($pdo, "SELECT COUNT(*) as count FROM ai_detections WHERE zone_id = ? AND is_threat = 1 AND DATE() = CURRENT_DATE", [$activeZoneId]),
         ];
 
         echo json_encode([
@@ -305,7 +305,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['action'])) {
                 $pdo->prepare("
                     UPDATE alarm_triggers
                     SET stopped_at = NOW(),
-                        duration_seconds = TIMESTAMPDIFF(SECOND, triggered_at, NOW()),
+                        duration_seconds = EXTRACT(EPOCH FROM NOW() - )::INT,
                         was_acknowledged = 1,
                         acknowledged_by = ?,
                         acknowledged_at = NOW()
@@ -347,7 +347,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['action'])) {
                 $stmt = $pdo->prepare("
                     UPDATE alarm_triggers SET
                         stopped_at = NOW(),
-                        duration_seconds = TIMESTAMPDIFF(SECOND, triggered_at, NOW()),
+                        duration_seconds = EXTRACT(EPOCH FROM NOW() - )::INT,
                         was_acknowledged = 1,
                         acknowledged_by = ?,
                         acknowledged_at = NOW()
@@ -388,8 +388,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['action'])) {
             safeExec($pdo, "
                 INSERT INTO zone_ai_settings (zone_id, sound_alerts_enabled, auto_ack_low_risk, auto_ack_minutes)
                 VALUES (?, ?, ?, ?)
-                ON DUPLICATE KEY UPDATE
-                    sound_alerts_enabled = VALUES(sound_alerts_enabled),
+                ON CONFLICT (sound_alerts_enabled) DO UPDATE SET sound_alerts_enabled = EXCLUDED.sound_alerts_enabled,
                     auto_ack_low_risk     = VALUES(auto_ack_low_risk),
                     auto_ack_minutes      = VALUES(auto_ack_minutes)
             ", [$activeZoneId, $sound, $auto, $mins]);
@@ -433,8 +432,8 @@ $stats = [
     'total_cameras'    => safeCount($pdo, "SELECT COUNT(*) as count FROM cctv_cameras WHERE zone_id = ?", [$activeZoneId]),
     'active_cameras'   => safeCount($pdo, "SELECT COUNT(*) as count FROM cctv_cameras WHERE zone_id = ? AND is_active = 1", [$activeZoneId]),
     'recording'        => safeCount($pdo, "SELECT COUNT(*) as count FROM cctv_cameras WHERE zone_id = ? AND is_recording = 1", [$activeZoneId]),
-    'today_detections' => safeCount($pdo, "SELECT COUNT(*) as count FROM ai_detections WHERE zone_id = ? AND DATE(detected_at) = CURDATE()", [$activeZoneId]),
-    'today_threats'    => safeCount($pdo, "SELECT COUNT(*) as count FROM ai_detections WHERE zone_id = ? AND is_threat = 1 AND DATE(detected_at) = CURDATE()", [$activeZoneId]),
+    'today_detections' => safeCount($pdo, "SELECT COUNT(*) as count FROM ai_detections WHERE zone_id = ? AND DATE() = CURRENT_DATE", [$activeZoneId]),
+    'today_threats'    => safeCount($pdo, "SELECT COUNT(*) as count FROM ai_detections WHERE zone_id = ? AND is_threat = 1 AND DATE() = CURRENT_DATE", [$activeZoneId]),
     'pending_alerts'   => safeCount($pdo, "SELECT COUNT(*) as count FROM ai_alerts WHERE zone_id = ? AND is_acknowledged = 0", [$activeZoneId]),
     'active_alarms'    => safeCount($pdo, "SELECT COUNT(*) as count FROM alarm_triggers WHERE zone_id = ? AND stopped_at IS NULL", [$activeZoneId]),
 ];
@@ -472,7 +471,7 @@ $alertSeverityBreakdown = safeFetchAll($pdo, "
 $trendRows = safeFetchAll($pdo, "
     SELECT DATE(detected_at) AS d, COUNT(*) AS c
     FROM ai_detections
-    WHERE zone_id = ? AND is_threat = 1 AND detected_at >= DATE_SUB(CURDATE(), INTERVAL 6 DAY)
+    WHERE zone_id = ? AND is_threat = 1 AND detected_at >= DATE_SUB(CURRENT_DATE, INTERVAL 6 DAY)
     GROUP BY DATE(detected_at)
 ", [$activeZoneId]);
 $trendByDate = [];
@@ -537,11 +536,11 @@ foreach ($zoneCameras as $c) {
     $cameraStats[$cid] = [
         'detections_today' => safeCount($pdo, "
             SELECT COUNT(*) as count FROM ai_detections
-            WHERE zone_id = ? AND camera_id = ? AND DATE(detected_at) = CURDATE()
+            WHERE zone_id = ? AND camera_id = ? AND DATE() = CURRENT_DATE
         ", [$activeZoneId, $cid]),
         'threats_today' => safeCount($pdo, "
             SELECT COUNT(*) as count FROM ai_detections
-            WHERE zone_id = ? AND camera_id = ? AND is_threat = 1 AND DATE(detected_at) = CURDATE()
+            WHERE zone_id = ? AND camera_id = ? AND is_threat = 1 AND DATE() = CURRENT_DATE
         ", [$activeZoneId, $cid]),
         'last_event' => (function () use ($pdo, $activeZoneId, $cid) {
             $r = safeFetchAll($pdo, "
@@ -563,7 +562,7 @@ $pendingAlerts = safeFetchAll($pdo, "
              WHERE i.zone_id = a.zone_id
                AND i.reported_at >= DATE_SUB(a.created_at, INTERVAL 5 MINUTE)
                AND i.reported_at <= DATE_ADD(a.created_at, INTERVAL 5 MINUTE)
-             ORDER BY ABS(TIMESTAMPDIFF(SECOND, i.reported_at, a.created_at))
+             ORDER BY ABS(EXTRACT(EPOCH FROM  - )::INT)
              LIMIT 1) AS linked_incident_id
     FROM ai_alerts a
     LEFT JOIN zones z ON a.zone_id = z.id

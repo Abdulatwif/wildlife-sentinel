@@ -1,4 +1,4 @@
-<?php
+﻿<?php
 // ============================================================
 // ranger/update_location.php
 // Receives GPS updates from the ranger map (every ~15s)
@@ -38,8 +38,7 @@ if (function_exists('updateRangerLocation')) {
             INSERT INTO ranger_live_tracking
                 (ranger_id, current_lat, current_lng, heading, speed, last_update, is_offline)
             VALUES (?, ?, ?, ?, ?, NOW(), 0)
-            ON DUPLICATE KEY UPDATE
-                current_lat = VALUES(current_lat),
+            ON CONFLICT (current_lat) DO UPDATE SET current_lat = EXCLUDED.current_lat,
                 current_lng = VALUES(current_lng),
                 heading     = VALUES(heading),
                 speed       = VALUES(speed),

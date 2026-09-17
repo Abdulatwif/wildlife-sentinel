@@ -1,4 +1,4 @@
-<?php
+﻿<?php
 // ============================================================
 // workers/ai_worker.php
 // Processes AI queue jobs: alarms, recalibrations, batch
@@ -33,7 +33,7 @@ if (!$dryRun) {
                     ELSE 0
                 END
                 FROM ai_feedback f
-                WHERE f.created_at >= DATE_SUB(NOW(), INTERVAL 7 DAY)
+                WHERE f.created_at >= NOW() - INTERVAL ' days'
             )))
             WHERE t.zone_id IS NOT NULL
         ");

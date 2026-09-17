@@ -1,4 +1,4 @@
-<?php
+﻿<?php
 // ============================================================
 // supervisor/simulation.php
 // Wildlife Sentinel — Zone Simulation Console (Supervisor)
@@ -89,17 +89,17 @@ function simExec(PDO $pdo, string $sql, array $params = []): bool {
 function simEnsureTables(PDO $pdo): void {
     $ddl = [
         "CREATE TABLE IF NOT EXISTS simulation_events (
-            id INT AUTO_INCREMENT PRIMARY KEY,
+            id INT  PRIMARY KEY,
             zone_id INT NOT NULL,
             actor_id INT NOT NULL,
             event_type VARCHAR(60) NOT NULL,
             description TEXT NULL,
             payload TEXT NULL,
-            created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
             INDEX idx_zone (zone_id),
             INDEX idx_actor (actor_id)
-        ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci",
-    ];
+        );
+
     foreach ($ddl as $sql) {
         try { $pdo->exec($sql); } catch (PDOException $e) { /* ignore */ }
     }
@@ -186,7 +186,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['action'])) {
             }
 
             if ($ok) {
-                $incId = (int)$pdo->lastInsertId();
+                $incId = (int)($stmt->fetch()['id'] ?? 0);
                 simLog($pdo, $activeZoneId, $user['id'], 'incident',
                     "Simulated {$severity} {$category} incident (ID {$incId}) from {$reporter[0]['full_name']}",
                     ['incident_id' => $incId, 'severity' => $severity, 'category' => $category]);
@@ -236,7 +236,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['action'])) {
             }
 
             if ($ok) {
-                $aiId = (int)$pdo->lastInsertId();
+                $aiId = (int)($stmt->fetch()['id'] ?? 0);
                 simLog($pdo, $activeZoneId, $user['id'], 'ai_alert',
                     "Simulated AI alert: {$type} ({$severity})",
                     ['ai_alert_id' => $aiId, 'type' => $type, 'severity' => $severity]);
@@ -276,7 +276,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['action'])) {
         }
 
         if ($ok) {
-            $alarmId = (int)$pdo->lastInsertId();
+            $alarmId = (int)($stmt->fetch()['id'] ?? 0);
             simLog($pdo, $activeZoneId, $user['id'], 'alarm',
                 "Simulated alarm: {$label} ({$source}, {$severity})",
                 ['alarm_id' => $alarmId, 'label' => $label, 'source' => $source]);
@@ -308,8 +308,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['action'])) {
                 INSERT INTO ranger_live_tracking
                     (ranger_id, current_lat, current_lng, heading, speed, last_update)
                 VALUES (?, ?, ?, ?, ?, NOW())
-                ON DUPLICATE KEY UPDATE
-                    current_lat = VALUES(current_lat),
+                ON CONFLICT (current_lat) DO UPDATE SET current_lat = EXCLUDED.current_lat,
                     current_lng = VALUES(current_lng),
                     heading = VALUES(heading),
                     speed = VALUES(speed),

@@ -1,4 +1,4 @@
-<?php
+﻿<?php
 // ============================================================
 // supervisor/users.php
 // Zone Supervisor — Manage users in own zone (rangers/scouts/tourism)

@@ -1,4 +1,4 @@
-<?php
+﻿<?php
 // ============================================================
 // ranger/request-manpower.php
 // Ranger — Request Manpower / Backup
@@ -96,7 +96,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['action']) && $_POST['
                 $stmt = $pdo->prepare("
                     INSERT INTO messages
                         (sender_id, recipient_id, incident_id, message_type, subject, content, severity, is_broadcast, requires_acknowledgment, created_at)
-                    VALUES (?, NULL, ?, 'manpower_request', ?, ?, ?, 1, 1, NOW())
+                    VALUES (?, NULL, ?, 'manpower_request', ?, ?, ?, 1, 1, NOW()) RETURNING id
                 ");
                 $stmt->execute([
                     $user['id'],
@@ -105,7 +105,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['action']) && $_POST['
                     $content,
                     $urgency === 'critical' ? 'critical' : 'high',
                 ]);
-                $mid = $pdo->lastInsertId();
+                $mid = (int)($stmt->fetch()['id'] ?? 0);
 
                 // Notify supervisors
                 $recipients = safeFetchAll($pdo, "

@@ -1,4 +1,4 @@
-<?php
+﻿<?php
 // ============================================================
 // admin/ai-dashboard.php
 // Wildlife Sentinel — AI Detection Dashboard (Admin)
@@ -57,7 +57,7 @@ if (!function_exists('ai_dash_table_exists')) {
             $stmt = $pdo->prepare("
                 SELECT COUNT(*) AS c
                 FROM information_schema.TABLES
-                WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = ?
+                WHERE TABLE_SCHEMA = current_database() AND TABLE_NAME = ?
             ");
             $stmt->execute([$table]);
             $cache[$table] = ((int)($stmt->fetch()['c'] ?? 0)) > 0;
@@ -111,13 +111,13 @@ $detSrc = $hasV2 ? 'v2' : ($hasLegacy ? 'legacy' : 'none');
 try {
     $pdo->exec("
         CREATE TABLE IF NOT EXISTS admin_ai_settings (
-            admin_id INT(11) PRIMARY KEY,
-            sound_alerts_enabled TINYINT(1) DEFAULT 1,
-            auto_ack_low_risk TINYINT(1) DEFAULT 0,
+            admin_id INT PRIMARY KEY,
+            sound_alerts_enabled BOOLEAN DEFAULT TRUE,
+            auto_ack_low_risk BOOLEAN DEFAULT FALSE,
             auto_ack_minutes INT DEFAULT 10,
-            updated_at DATETIME DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP
-        ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
-    ");
+            updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP
+        );
+
 } catch (PDOException $e) { /* optional */ }
 
 $adminSettings = ai_dash_safe_fetch_all($pdo, "SELECT * FROM admin_ai_settings WHERE admin_id = ? LIMIT 1", [$user['id']]);
@@ -155,10 +155,10 @@ $filterWindow  = in_array($_GET['win']    ?? '', ['1h','24h','7d'], true) ? $_GE
 $filterMinConf = isset($_GET['minconf']) ? max(0, min(100, (int)$_GET['minconf'])) : $confidenceFloorPct;
 
 $windowSql = [
-    '1h'  => 'DATE_SUB(NOW(), INTERVAL 1 HOUR)',
-    '24h' => 'DATE_SUB(NOW(), INTERVAL 24 HOUR)',
-    '7d'  => 'DATE_SUB(NOW(), INTERVAL 7 DAY)',
-][$filterWindow] ?? 'DATE_SUB(NOW(), INTERVAL 24 HOUR)';
+    '1h'  => 'NOW() - INTERVAL ' hours'',
+    '24h' => 'NOW() - INTERVAL ' hours'',
+    '7d'  => 'NOW() - INTERVAL ' days'',
+][$filterWindow] ?? 'NOW() - INTERVAL ' hours'';
 
 $zoneWhere  = $filterZone > 0 ? ' AND zone_id = ? ' : ' ';
 $zoneParams = $filterZone > 0 ? [$filterZone] : [];
@@ -229,8 +229,8 @@ if (isset($_GET['ajax'])) {
         $stats = [
             'pending_alerts'   => $hasAiAlerts ? ai_dash_safe_count($pdo, "SELECT COUNT(*) as count FROM ai_alerts WHERE is_acknowledged = 0 $zoneSql2") : 0,
             'active_alarms'    => $hasAiAlarms ? ai_dash_safe_count($pdo, "SELECT COUNT(*) as count FROM alarm_triggers WHERE stopped_at IS NULL " . ($filterZone > 0 ? 'AND zone_id = ' . (int)$filterZone : '')) : 0,
-            'today_detections' => $detSrc !== 'none' ? ai_dash_safe_count($pdo, "SELECT COUNT(*) as count FROM " . ($detSrc === 'v2' ? 'ai_detections_v2' : 'ai_detections') . " WHERE DATE(detected_at) = CURDATE() " . ($filterZone > 0 ? 'AND zone_id = ' . (int)$filterZone : '')) : 0,
-            'today_threats'    => $detSrc !== 'none' ? ai_dash_safe_count($pdo, "SELECT COUNT(*) as count FROM " . ($detSrc === 'v2' ? 'ai_detections_v2' : 'ai_detections') . " WHERE is_threat = 1 AND DATE(detected_at) = CURDATE() " . ($filterZone > 0 ? 'AND zone_id = ' . (int)$filterZone : '')) : 0,
+            'today_detections' => $detSrc !== 'none' ? ai_dash_safe_count($pdo, "SELECT COUNT(*) as count FROM " . ($detSrc === 'v2' ? 'ai_detections_v2' : 'ai_detections') . " WHERE DATE() = CURRENT_DATE " . ($filterZone > 0 ? 'AND zone_id = ' . (int)$filterZone : '')) : 0,
+            'today_threats'    => $detSrc !== 'none' ? ai_dash_safe_count($pdo, "SELECT COUNT(*) as count FROM " . ($detSrc === 'v2' ? 'ai_detections_v2' : 'ai_detections') . " WHERE is_threat = 1 AND DATE() = CURRENT_DATE " . ($filterZone > 0 ? 'AND zone_id = ' . (int)$filterZone : '')) : 0,
         ];
 
         echo json_encode([
@@ -333,7 +333,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['action'])) {
                 if ($hasAiAlarms) {
                     $pdo->prepare("
                         UPDATE alarm_triggers SET stopped_at = NOW(),
-                            duration_seconds = TIMESTAMPDIFF(SECOND, triggered_at, NOW()),
+                            duration_seconds = EXTRACT(EPOCH FROM NOW() - )::INT,
                             was_acknowledged = 1, acknowledged_by = ?, acknowledged_at = NOW()
                         WHERE alert_id = ? AND stopped_at IS NULL
                     ")->execute([$user['id'], $alertId]);
@@ -364,7 +364,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['action'])) {
             } else {
                 $pdo->prepare("
                     UPDATE alarm_triggers SET stopped_at = NOW(),
-                        duration_seconds = TIMESTAMPDIFF(SECOND, triggered_at, NOW()),
+                        duration_seconds = EXTRACT(EPOCH FROM NOW() - )::INT,
                         was_acknowledged = 1, acknowledged_by = ?, acknowledged_at = NOW()
                     WHERE id = ? AND stopped_at IS NULL
                 ")->execute([$user['id'], $triggerId]);
@@ -391,7 +391,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['action'])) {
 
             $stmt = $pdo->prepare("
                 UPDATE alarm_triggers SET stopped_at = NOW(),
-                    duration_seconds = TIMESTAMPDIFF(SECOND, triggered_at, NOW()),
+                    duration_seconds = EXTRACT(EPOCH FROM NOW() - )::INT,
                     was_acknowledged = 1, acknowledged_by = ?, acknowledged_at = NOW()
                 WHERE $where
             ");
@@ -417,8 +417,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['action'])) {
                 $pdo->prepare("
                     INSERT INTO admin_ai_settings (admin_id, sound_alerts_enabled, auto_ack_low_risk, auto_ack_minutes)
                     VALUES (?, ?, ?, ?)
-                    ON DUPLICATE KEY UPDATE
-                        sound_alerts_enabled = VALUES(sound_alerts_enabled),
+                    ON CONFLICT (sound_alerts_enabled) DO UPDATE SET sound_alerts_enabled = EXCLUDED.sound_alerts_enabled,
                         auto_ack_low_risk     = VALUES(auto_ack_low_risk),
                         auto_ack_minutes      = VALUES(auto_ack_minutes)
                 ")->execute([$user['id'], $sound, $auto, $mins]);
@@ -463,8 +462,8 @@ $recordingCams   = $hasCameras ? ai_dash_safe_count($pdo, "SELECT COUNT(*) as co
 
 $detTable = $detSrc === 'v2' ? 'ai_detections_v2' : ($detSrc === 'legacy' ? 'ai_detections' : null);
 
-$todayDetections = $detTable ? ai_dash_safe_count($pdo, "SELECT COUNT(*) as count FROM {$detTable} WHERE DATE(detected_at) = CURDATE() " . $zfAnd) : 0;
-$todayThreats    = $detTable ? ai_dash_safe_count($pdo, "SELECT COUNT(*) as count FROM {$detTable} WHERE is_threat = 1 AND DATE(detected_at) = CURDATE() " . $zfAnd) : 0;
+$todayDetections = $detTable ? ai_dash_safe_count($pdo, "SELECT COUNT(*) as count FROM {$detTable} WHERE DATE() = CURRENT_DATE " . $zfAnd) : 0;
+$todayThreats    = $detTable ? ai_dash_safe_count($pdo, "SELECT COUNT(*) as count FROM {$detTable} WHERE is_threat = 1 AND DATE() = CURRENT_DATE " . $zfAnd) : 0;
 $pendingAlerts   = $hasAiAlerts ? ai_dash_safe_count($pdo, "SELECT COUNT(*) as count FROM ai_alerts WHERE is_acknowledged = 0 " . $zfAnd) : 0;
 $activeAlarms    = $hasAiAlarms ? ai_dash_safe_count($pdo, "SELECT COUNT(*) as count FROM alarm_triggers WHERE stopped_at IS NULL " . $zfAnd) : 0;
 
@@ -517,7 +516,7 @@ $alertSeverityBreakdown = $hasAiAlerts ? ai_dash_safe_fetch_all($pdo, "
 $trendRows = $detTable ? ai_dash_safe_fetch_all($pdo, "
     SELECT DATE(detected_at) AS d, COUNT(*) AS c
     FROM {$detTable}
-    WHERE is_threat = 1 AND detected_at >= DATE_SUB(CURDATE(), INTERVAL 6 DAY) " . $zfAnd . "
+    WHERE is_threat = 1 AND detected_at >= DATE_SUB(CURRENT_DATE, INTERVAL 6 DAY) " . $zfAnd . "
     GROUP BY DATE(detected_at)
 ") : [];
 $trendByDate = [];
@@ -535,8 +534,8 @@ if ($hasCameras && $detTable) {
     $zoneBreakdown = ai_dash_safe_fetch_all($pdo, "
         SELECT z.id, z.name,
             (SELECT COUNT(*) FROM cctv_cameras c WHERE c.zone_id = z.id) AS cameras,
-            (SELECT COUNT(*) FROM {$detTable} d WHERE d.zone_id = z.id AND d.detected_at >= DATE_SUB(NOW(), INTERVAL 24 HOUR)) AS det_24h,
-            (SELECT COUNT(*) FROM {$detTable} d WHERE d.zone_id = z.id AND d.is_threat = 1 AND d.detected_at >= DATE_SUB(NOW(), INTERVAL 24 HOUR)) AS threats_24h,
+            (SELECT COUNT(*) FROM {$detTable} d WHERE d.zone_id = z.id AND d.detected_at >= NOW() - INTERVAL ' hours') AS det_24h,
+            (SELECT COUNT(*) FROM {$detTable} d WHERE d.zone_id = z.id AND d.is_threat = 1 AND d.detected_at >= NOW() - INTERVAL ' hours') AS threats_24h,
             " . ($hasAiAlerts ? "(SELECT COUNT(*) FROM ai_alerts a WHERE a.zone_id = z.id AND a.is_acknowledged = 0)" : "0") . " AS pending_alerts,
             " . ($hasAiAlarms ? "(SELECT COUNT(*) FROM alarm_triggers t WHERE t.zone_id = z.id AND t.stopped_at IS NULL)" : "0") . " AS active_alarms
         FROM zones z WHERE z.is_active = 1

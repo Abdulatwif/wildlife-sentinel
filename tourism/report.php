@@ -1,4 +1,4 @@
-<?php
+﻿<?php
 // ============================================================
 // tourism/report.php
 // Tourism / Lodge Operator — Report Incident
@@ -293,7 +293,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && ($_POST['action'] ?? '') === 'submi
                     (reporter_id, reporter_type, zone_id, category, severity,
                      description, location_lat, location_lng, location_geojson,
                      media_urls, status, reported_at, is_simulated)
-                VALUES (?, 'tourism', ?, ?, ?, ?, ?, ?, ST_GeomFromText(?), ?, 'reported', NOW(), 0)
+                VALUES (?, 'tourism', ?, ?, ?, ?, ?, ?, ?, 'reported', NOW(), 0) RETURNING id
             ");
             $stmt->execute([
                 $user['id'],
@@ -306,7 +306,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && ($_POST['action'] ?? '') === 'submi
                 $geojson,
                 $mediaUrls ? json_encode($mediaUrls) : null,
             ]);
-            $newIncidentId = (int)$pdo->lastInsertId();
+            $newIncidentId = (int)($stmt->fetch()['id'] ?? 0);
 
             // ------------------------------------------------
             // 1. IN-APP NOTIFICATIONS — respects notify_on_incident

@@ -1,4 +1,4 @@
-<?php
+﻿<?php
 // ============================================================
 // api/incidents.php
 // Wildlife Sentinel — Incidents API
@@ -382,7 +382,7 @@ try {
                     try {
                         $stmt = $pdo->prepare("
                             INSERT INTO incident_responses (incident_id, ranger_id, status_update, notes, created_at)
-                            VALUES (?, ?, ?, ?, NOW())
+                            VALUES (?, ?, ?, ?, NOW()) RETURNING id
                         ");
                         $stmt->execute([$incidentId, $user['id'], $newStatus, $notes]);
                     } catch (PDOException $e) { /* optional table */ }
@@ -466,7 +466,7 @@ try {
             try {
                 $stmt = $pdo->prepare("
                     INSERT INTO incident_responses (incident_id, ranger_id, status_update, notes, created_at)
-                    VALUES (?, ?, ?, ?, NOW())
+                    VALUES (?, ?, ?, ?, NOW()) RETURNING id
                 ");
                 $stmt->execute([$incidentId, $user['id'], $statusUpdate, $notes]);
             } catch (PDOException $e) {
@@ -560,7 +560,7 @@ try {
                 JOIN users u ON i.reporter_id = u.id
                 LEFT JOIN zones z ON i.zone_id = z.id
                 WHERE " . implode(' AND ', $where) . "
-                HAVING distance < ?
+                HAVING (6371 * acos(cos(radians(?)) * cos(radians(location_lat)) * cos(radians(location_lng) - radians(?)) + sin(radians(?)) * sin(radians(location_lat)))) < ?
                 ORDER BY distance ASC, FIELD(i.severity,'critical','high','medium','low')
                 LIMIT ?
             ";

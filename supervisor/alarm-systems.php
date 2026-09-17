@@ -1,4 +1,4 @@
-<?php
+﻿<?php
 // ============================================================
 // supervisor/alarm-systems.php
 // Zone Supervisor — Real Alarm Systems (zone-scoped)
@@ -91,44 +91,44 @@ if (!function_exists('ws_al_safe_url')) {
 try {
     $pdo->exec("
         CREATE TABLE IF NOT EXISTS alarm_systems (
-            id INT(11) AUTO_INCREMENT PRIMARY KEY,
-            zone_id INT(11) NOT NULL,
+            id SERIAL PRIMARY KEY,
+            zone_id INT NOT NULL,
             alarm_name VARCHAR(255) NOT NULL,
             alarm_type ENUM('siren','bell','strobe','speaker','combined') DEFAULT 'siren',
             sound_url VARCHAR(500) NULL,
             sound_volume INT DEFAULT 80,
             siren_duration INT DEFAULT 180,
             trigger_delay_seconds INT DEFAULT 120,
-            auto_sound_on_incident TINYINT(1) DEFAULT 1,
+            auto_sound_on_incident BOOLEAN DEFAULT TRUE,
             location_lat DECIMAL(10,8) NULL,
             location_lng DECIMAL(11,8) NULL,
-            is_active TINYINT(1) DEFAULT 1,
-            last_triggered DATETIME NULL,
+            is_active BOOLEAN DEFAULT TRUE,
+            last_triggered TIMESTAMP NULL,
             trigger_count INT DEFAULT 0,
-            created_at DATETIME DEFAULT CURRENT_TIMESTAMP
-        ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
-    ");
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        );
+
 
     $pdo->exec("
         CREATE TABLE IF NOT EXISTS alarm_triggers (
-            id INT(11) AUTO_INCREMENT PRIMARY KEY,
-            alarm_id INT(11) NULL,
-            alert_id INT(11) NULL,
-            incident_id INT(11) NULL,
-            zone_id INT(11) NOT NULL,
+            id SERIAL PRIMARY KEY,
+            alarm_id INT NULL,
+            alert_id INT NULL,
+            incident_id INT NULL,
+            zone_id INT NOT NULL,
             triggered_by ENUM('ai_detection','manual','schedule','auto_incident') DEFAULT 'manual',
             trigger_reason VARCHAR(255) NULL,
-            triggered_at DATETIME DEFAULT CURRENT_TIMESTAMP,
-            stopped_at DATETIME NULL,
+            triggered_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            stopped_at TIMESTAMP NULL,
             duration_seconds INT NULL,
-            was_acknowledged TINYINT(1) DEFAULT 0,
-            acknowledged_by INT(11) NULL,
-            acknowledged_at DATETIME NULL,
+            was_acknowledged BOOLEAN DEFAULT FALSE,
+            acknowledged_by INT NULL,
+            acknowledged_at TIMESTAMP NULL,
             INDEX idx_zone (zone_id),
             INDEX idx_active (stopped_at),
             INDEX idx_incident (incident_id)
-        ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
-    ");
+        );
+
 
     $existingCols = [];
     try {
@@ -141,7 +141,7 @@ try {
         'sound_volume'           => "INT DEFAULT 80",
         'siren_duration'         => "INT DEFAULT 180",
         'trigger_delay_seconds'  => "INT DEFAULT 120",
-        'auto_sound_on_incident' => "TINYINT(1) DEFAULT 1",
+        'auto_sound_on_incident' => "BOOLEAN DEFAULT TRUE",
     ] as $col => $def) {
         if (!in_array($col, $existingCols)) {
             try { $pdo->exec("ALTER TABLE alarm_systems ADD COLUMN `$col` $def"); } catch (PDOException $e) {}
@@ -285,7 +285,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['action'])) {
                             (alarm_id, zone_id, triggered_by, trigger_reason, triggered_at)
                         VALUES (?, ?, 'manual', 'Manual trigger by supervisor', NOW())
                     ")->execute([$id, $activeZoneId]);
-                    $triggerId = (int)$pdo->lastInsertId();
+                    $triggerId = (int)($stmt->fetch()['id'] ?? 0);
 
                     $pdo->prepare("
                         UPDATE alarm_systems
@@ -374,7 +374,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['action'])) {
                 $stmt = $pdo->prepare("
                     UPDATE alarm_triggers SET
                         stopped_at = NOW(),
-                        duration_seconds = TIMESTAMPDIFF(SECOND, triggered_at, NOW()),
+                        duration_seconds = EXTRACT(EPOCH FROM NOW() - )::INT,
                         was_acknowledged = 1,
                         acknowledged_by = ?,
                         acknowledged_at = NOW()
@@ -402,7 +402,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['action'])) {
             $stmt = $pdo->prepare("
                 UPDATE alarm_triggers SET
                     stopped_at = NOW(),
-                    duration_seconds = TIMESTAMPDIFF(SECOND, triggered_at, NOW()),
+                    duration_seconds = EXTRACT(EPOCH FROM NOW() - )::INT,
                     was_acknowledged = 1,
                     acknowledged_by = ?,
                     acknowledged_at = NOW()
@@ -500,7 +500,7 @@ $stats = [
     'active'          => safeCount($pdo, "SELECT COUNT(*) as count FROM alarm_systems WHERE zone_id = ? AND is_active = 1", [$activeZoneId]),
     'inactive'        => safeCount($pdo, "SELECT COUNT(*) as count FROM alarm_systems WHERE zone_id = ? AND is_active = 0", [$activeZoneId]),
     'active_triggers' => safeCount($pdo, "SELECT COUNT(*) as count FROM alarm_triggers WHERE zone_id = ? AND stopped_at IS NULL", [$activeZoneId]),
-    'today_triggers'  => safeCount($pdo, "SELECT COUNT(*) as count FROM alarm_triggers WHERE zone_id = ? AND DATE(triggered_at) = CURDATE()", [$activeZoneId]),
+    'today_triggers'  => safeCount($pdo, "SELECT COUNT(*) as count FROM alarm_triggers WHERE zone_id = ? AND DATE() = CURRENT_DATE", [$activeZoneId]),
     'total_triggers'  => safeCount($pdo, "SELECT COUNT(*) as count FROM alarm_triggers WHERE zone_id = ?", [$activeZoneId]),
 ];
 

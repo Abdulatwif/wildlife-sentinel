@@ -1,4 +1,4 @@
-<?php
+﻿<?php
 require_once 'includes/functions.php';
 
 // Check if admin already exists
@@ -42,14 +42,15 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
             // First create a default zone
             $pdo->exec("
                 INSERT INTO zones (name, description, center_lat, center_lng, is_active) 
-                VALUES ('Headquarters', 'Main Administrative Zone', -15.3875, 28.3228, 1)
+                VALUES ('Headquarters', 'Main Administrative Zone', -15.3875, 28.3228, TRUE) RETURNING id
             ");
-            $zoneId = $pdo->lastInsertId();
+            $zr = $pdo->query("SELECT id FROM zones ORDER BY id DESC LIMIT 1")->fetch();
+            $zoneId = (int)$zr['id'];
             
             // Create admin user
             $stmt = $pdo->prepare("
                 INSERT INTO users (email, phone, password_hash, full_name, role, zone_id, is_active, created_at)
-                VALUES (?, ?, ?, ?, 'admin', ?, 1, NOW())
+                VALUES (?, ?, ?, ?, 'admin', ?, 1, NOW()) RETURNING id
             ");
             
             if ($stmt->execute([$email, $phone, $hash, $fullName, $zoneId])) {

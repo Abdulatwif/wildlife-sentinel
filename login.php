@@ -1,4 +1,4 @@
-<?php
+﻿<?php
 // ============================================================
 // login.php
 // Wildlife Sentinel — Login + First-Time Admin Setup
@@ -240,34 +240,33 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST'
                         } else {
                             $pdo->exec("
                                 INSERT INTO zones (name, description, center_lat, center_lng, is_active)
-                                VALUES ('Headquarters','Main Administrative Zone - Lusaka, Zambia',-15.3875,28.3228,1)
+                                VALUES ('Headquarters','Main Administrative Zone - Lusaka, Zambia',-15.3875,28.3228,TRUE) RETURNING id
                             ");
-                            $zoneId = (int)$pdo->lastInsertId();
+                            $zr2 = $pdo->query("SELECT id FROM zones ORDER BY id DESC LIMIT 1")->fetch();
+                            $zoneId = (int)$zr2['id'];
                         }
 
                         $hash = hashPassword($password);
                         $stmt = $pdo->prepare("
                             INSERT INTO users
                                 (email, phone, password_hash, full_name, role, zone_id, is_active, created_at)
-                            VALUES (?, ?, ?, ?, 'admin', ?, 1, NOW())
-                        ");
+                            VALUES (?, ?, ?, ?, 'admin', ?, TRUE, NOW())
+                            RETURNING id ");
                         $stmt->execute([
-                            $email,
-                            $phone !== '' ? $phone : null,
-                            $hash,
-                            $fullName,
-                            $zoneId,
+                            $email, $phone !== '' ? $phone : null,
+                            $hash, $fullName, $zoneId,
                         ]);
-                        $newId = (int)$pdo->lastInsertId();
+                        $row   = $stmt->fetch(PDO::FETCH_ASSOC);
+                        $newId = $row ? (int)$row['id'] : 0;
 
                         // Seed per-admin AI settings row
                         try {
-                            $pdo->prepare("INSERT IGNORE INTO admin_ai_settings (admin_id) VALUES (?)")->execute([$newId]);
+                            $pdo->prepare("INSERT INTO admin_ai_settings (admin_id) VALUES (?) ON CONFLICT DO NOTHING")->execute([$newId]);
                         } catch (Throwable $e) { /* optional */ }
 
                         // Seed per-user preferences
                         try {
-                            $pdo->prepare("INSERT IGNORE INTO user_preferences (user_id) VALUES (?)")->execute([$newId]);
+                            $pdo->prepare("INSERT INTO user_preferences (user_id) VALUES (?) ON CONFLICT DO NOTHING")->execute([$newId]);
                         } catch (Throwable $e) { /* optional */ }
 
                         $pdo->commit();

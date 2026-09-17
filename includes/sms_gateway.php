@@ -1,4 +1,4 @@
-<?php
+﻿<?php
 // ============================================================
 // includes/sms_gateway.php
 // Wildlife Sentinel — SMS Gateway
@@ -730,7 +730,7 @@ class SMSGateway
                 SELECT COUNT(*) AS c
                 FROM sms_logs
                 WHERE phone = ?
-                  AND created_at >= DATE_SUB(NOW(), INTERVAL 1 DAY)
+                  AND created_at >= NOW() - INTERVAL '1 day'
             ");
             $stmt->execute([$normalizedPhone]);
             $count = (int)($stmt->fetch()['c'] ?? 0);
@@ -756,7 +756,7 @@ class SMSGateway
                         (user_id, phone, message, message_type, incident_id, alert_id,
                          status, provider, provider_ref, error_message, segments,
                          sent_at, created_at)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NOW(), NOW())
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NOW(), NOW()) RETURNING id
                 ");
                 $stmt->execute([
                     $row['user_id']       ?? null,

@@ -1,4 +1,4 @@
-<?php
+﻿<?php
 // ============================================================
 // supervisor/alarm-auto-trigger.php
 // SERVER-SIDE AUTO-TRIGGER RULE
@@ -69,7 +69,7 @@ function runAutoTriggers(PDO $pdo, bool $notifyAlarm): void {
             SELECT i.id, i.zone_id, i.severity, i.category, i.reported_at
             FROM incidents i
             WHERE i.status = 'reported'
-              AND TIMESTAMPDIFF(SECOND, i.reported_at, NOW()) >= 30
+              AND EXTRACT(EPOCH FROM NOW() - )::INT >= 30
               AND i.zone_id IS NOT NULL
         ");
         $incidents = $stmt->fetchAll();
@@ -123,7 +123,7 @@ function runAutoTriggers(PDO $pdo, bool $notifyAlarm): void {
                 if ($stmt->fetch()) continue;
             } catch (PDOException $e) {
                 // Column may be missing — add it
-                try { $pdo->exec("ALTER TABLE alarm_triggers ADD COLUMN incident_id INT(11) NULL"); } catch (PDOException $e2) {}
+                try { $pdo->exec("ALTER TABLE alarm_triggers ADD COLUMN incident_id INT NULL"); } catch (PDOException $e2) {}
             }
 
             // Fire the alarm
@@ -207,11 +207,11 @@ function runAutoStop(PDO $pdo): void {
             UPDATE alarm_triggers at
             JOIN alarm_systems a ON at.alarm_id = a.id
             SET at.stopped_at = NOW(),
-                at.duration_seconds = TIMESTAMPDIFF(SECOND, at.triggered_at, NOW()),
+                at.duration_seconds = EXTRACT(EPOCH FROM NOW() - )::INT,
                 at.was_acknowledged = 1
             WHERE at.stopped_at IS NULL
               AND a.siren_duration > 0
-              AND TIMESTAMPDIFF(SECOND, at.triggered_at, NOW()) > a.siren_duration
+              AND EXTRACT(EPOCH FROM NOW() - )::INT > a.siren_duration
         ");
         echo "Auto-stopped expired alarms.\n";
     } catch (PDOException $e) {

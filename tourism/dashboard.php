@@ -1,4 +1,4 @@
-<?php
+﻿<?php
 // ============================================================
 // tourism/dashboard.php
 // Tourism / Lodge Operator — Dashboard

@@ -1,4 +1,4 @@
-<?php
+﻿<?php
 // ============================================================
 // ranger/incidents.php
 // Ranger — Incident List with Photos + Turn-by-Turn Navigation

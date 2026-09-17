@@ -1,4 +1,4 @@
-<?php
+﻿<?php
 // ============================================================
 // admin/sms-gateway.php
 // Wildlife Sentinel — SMS Gateway Management
@@ -582,14 +582,14 @@ $stats = [
     'sent'      => safeCount($pdo, "SELECT COUNT(*) AS count FROM sms_logs WHERE status = 'sent'"),
     'pending'   => safeCount($pdo, "SELECT COUNT(*) AS count FROM sms_logs WHERE status = 'pending'"),
     'failed'    => safeCount($pdo, "SELECT COUNT(*) AS count FROM sms_logs WHERE status = 'failed'"),
-    'today'     => safeCount($pdo, "SELECT COUNT(*) AS count FROM sms_logs WHERE DATE(created_at) = CURDATE()"),
-    'this_week' => safeCount($pdo, "SELECT COUNT(*) AS count FROM sms_logs WHERE created_at >= DATE_SUB(NOW(), INTERVAL 7 DAY)"),
+    'today'     => safeCount($pdo, "SELECT COUNT(*) AS count FROM sms_logs WHERE DATE() = CURRENT_DATE"),
+    'this_week' => safeCount($pdo, "SELECT COUNT(*) AS count FROM sms_logs WHERE created_at >= NOW() - INTERVAL ' days'"),
 ];
 
 // Network breakdown (approx via phone prefix)
 $netBreakdown = ['mtn'=>0, 'airtel'=>0, 'zamtel'=>0, 'unknown'=>0];
 try {
-    $rows = $pdo->query("SELECT phone FROM sms_logs WHERE created_at >= DATE_SUB(NOW(), INTERVAL 7 DAY)")->fetchAll();
+    $rows = $pdo->query("SELECT phone FROM sms_logs WHERE created_at >= NOW() - INTERVAL ' days'")->fetchAll();
     foreach ($rows as $r) {
         $n = normalizeZambianPhone($r['phone'] ?? '');
         if (!$n) { $netBreakdown['unknown']++; continue; }

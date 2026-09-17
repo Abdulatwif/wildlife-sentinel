@@ -1,4 +1,4 @@
-<?php
+﻿<?php
 // ============================================================
 // includes/sidebar.php
 // Wildlife Sentinel — Role-Aware Sidebar (v3.2)

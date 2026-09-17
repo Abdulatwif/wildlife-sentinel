@@ -1,4 +1,4 @@
-<?php
+﻿<?php
 // ============================================================
 // ai-service/ai_engine.php
 // Wildlife Sentinel — Advanced AI Analysis Engine (v2)
@@ -537,7 +537,7 @@ class AIEngine
                      ?, ?,
                      ?, ?,
                      ?, ?,
-                     NOW(), NOW())
+                     NOW(), NOW()) RETURNING id
             ");
             $stmt->execute([
                 $pre['camera_id'], $pre['zone_id'], $pre['detection_type'], $pre['subclass'],
@@ -553,7 +553,7 @@ class AIEngine
                 $pre['snapshot_url'], $pre['clip_url'],
                 $pre['lat'], $pre['lng'],
             ]);
-            return (int)$this->pdo->lastInsertId();
+            return (int)($stmt->fetch(PDO::FETCH_ASSOC)['id'] ?? 0);
         } catch (PDOException $e) {
             error_log('[WS-AI] persistDetection: ' . $e->getMessage());
             return null;
@@ -579,12 +579,13 @@ class AIEngine
                     (detection_id, zone_id, alert_type, severity, title, description,
                      location_lat, location_lng, created_at)
                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, NOW())
-            ");
+                RETURNING id ");
             $stmt->execute([
                 $detectionId, $pre['zone_id'], $alertType, $threat['level'],
                 $title, $desc, $pre['lat'], $pre['lng'],
             ]);
-            return (int)$this->pdo->lastInsertId();
+            $row = $stmt->fetch(PDO::FETCH_ASSOC);
+            return $row ? (int)$row['id'] : null;
         } catch (PDOException $e) {
             error_log('[WS-AI] createAlert: ' . $e->getMessage());
             return null;
@@ -597,7 +598,7 @@ class AIEngine
             $stmt = $this->pdo->prepare("
                 INSERT INTO ai_queue
                     (job_type, priority, zone_id, payload, scheduled_for)
-                VALUES ('alert', ?, ?, ?, NOW())
+                VALUES ('alert', ?, ?, ?, NOW()) RETURNING id
             ");
             $stmt->execute([
                 $level === 'critical' ? 1 : 2,

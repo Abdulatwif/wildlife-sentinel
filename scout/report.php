@@ -1,4 +1,4 @@
-<?php
+﻿<?php
 // ============================================================
 // scout/report.php
 // Community Scout — Report Incident
@@ -279,7 +279,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && ($_POST['action'] ?? '') === 'submi
                     (reporter_id, reporter_type, zone_id, category, severity,
                      description, location_lat, location_lng, location_geojson,
                      media_urls, status, reported_at, is_simulated)
-                VALUES (?, 'scout', ?, ?, ?, ?, ?, ?, ST_GeomFromText(?), ?, 'reported', NOW(), 0)
+                VALUES (?, 'scout', ?, ?, ?, ?, ?, ?, ?, 'reported', NOW(), 0) RETURNING id
             ");
             $stmt->execute([
                 $user['id'],
@@ -292,7 +292,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && ($_POST['action'] ?? '') === 'submi
                 $geojson,
                 $mediaUrls ? json_encode($mediaUrls) : null,
             ]);
-            $newIncidentId = (int)$pdo->lastInsertId();
+            $newIncidentId = (int)($stmt->fetch()['id'] ?? 0);
 
             // ------------------------------------------------
             // 1. IN-APP NOTIFICATIONS — respects notify_on_incident

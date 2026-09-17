@@ -1,4 +1,4 @@
-<?php
+﻿<?php
 // ============================================================
 // supervisor/zone-settings.php
 // Zone Supervisor — Zone System Settings
@@ -85,50 +85,50 @@ $globalCctvSnapshotDir = (string) ws_zs_global('cctv_snapshot_dir', 'uploads/cct
 try {
     $pdo->exec("
         CREATE TABLE IF NOT EXISTS zone_notification_settings (
-            zone_id INT(11) PRIMARY KEY,
-            sms_enabled TINYINT(1) DEFAULT 1,
-            alarm_enabled TINYINT(1) DEFAULT 1,
-            ai_detection_enabled TINYINT(1) DEFAULT 1,
+            zone_id INT PRIMARY KEY,
+            sms_enabled BOOLEAN DEFAULT TRUE,
+            alarm_enabled BOOLEAN DEFAULT TRUE,
+            ai_detection_enabled BOOLEAN DEFAULT TRUE,
             alarm_delay_seconds INT DEFAULT 120,
             ai_confidence_threshold INT DEFAULT 70,
-            auto_create_incidents TINYINT(1) DEFAULT 1,
-            updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
-        ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
-    ");
+            auto_create_incidents BOOLEAN DEFAULT TRUE,
+            updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        );
+
 
     $pdo->exec("
         CREATE TABLE IF NOT EXISTS zone_system_settings (
-            zone_id INT(11) PRIMARY KEY,
-            ai_enabled TINYINT(1) DEFAULT 1,
+            zone_id INT PRIMARY KEY,
+            ai_enabled BOOLEAN DEFAULT TRUE,
             ai_confidence_min INT DEFAULT 70,
-            ai_auto_create_alert TINYINT(1) DEFAULT 1,
-            ai_auto_trigger_alarm TINYINT(1) DEFAULT 0,
+            ai_auto_create_alert BOOLEAN DEFAULT TRUE,
+            ai_auto_trigger_alarm BOOLEAN DEFAULT FALSE,
             ai_detection_types VARCHAR(255) DEFAULT 'human,animal,vehicle,fire,gunshot',
             cctv_retention_days INT DEFAULT 30,
             cctv_default_quality VARCHAR(20) DEFAULT '1080p',
-            cctv_auto_record TINYINT(1) DEFAULT 1,
+            cctv_auto_record BOOLEAN DEFAULT TRUE,
             cctv_snapshot_dir VARCHAR(255) DEFAULT 'uploads/cctv/',
             alarm_default_type VARCHAR(20) DEFAULT 'siren',
             alarm_siren_duration INT DEFAULT 180,
-            alarm_auto_stop TINYINT(1) DEFAULT 1,
-            alarm_sms_blast TINYINT(1) DEFAULT 1,
-            notif_sms TINYINT(1) DEFAULT 1,
-            notif_email TINYINT(1) DEFAULT 0,
-            notif_push TINYINT(1) DEFAULT 1,
-            notif_on_incident TINYINT(1) DEFAULT 1,
-            notif_on_ai_alert TINYINT(1) DEFAULT 1,
-            notif_on_alarm TINYINT(1) DEFAULT 1,
-            notif_on_manpower TINYINT(1) DEFAULT 1,
-            notif_offline_reminder TINYINT(1) DEFAULT 1,
-            perm_rangers_ack TINYINT(1) DEFAULT 1,
-            perm_rangers_trigger_alarm TINYINT(1) DEFAULT 0,
-            perm_rangers_request_manpower TINYINT(1) DEFAULT 1,
-            perm_scouts_report TINYINT(1) DEFAULT 1,
-            perm_scouts_see_sensitive TINYINT(1) DEFAULT 0,
-            perm_tourism_see_risk TINYINT(1) DEFAULT 1,
-            updated_at DATETIME DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP
-        ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
-    ");
+            alarm_auto_stop BOOLEAN DEFAULT TRUE,
+            alarm_sms_blast BOOLEAN DEFAULT TRUE,
+            notif_sms BOOLEAN DEFAULT TRUE,
+            notif_email BOOLEAN DEFAULT FALSE,
+            notif_push BOOLEAN DEFAULT TRUE,
+            notif_on_incident BOOLEAN DEFAULT TRUE,
+            notif_on_ai_alert BOOLEAN DEFAULT TRUE,
+            notif_on_alarm BOOLEAN DEFAULT TRUE,
+            notif_on_manpower BOOLEAN DEFAULT TRUE,
+            notif_offline_reminder BOOLEAN DEFAULT TRUE,
+            perm_rangers_ack BOOLEAN DEFAULT TRUE,
+            perm_rangers_trigger_alarm BOOLEAN DEFAULT FALSE,
+            perm_rangers_request_manpower BOOLEAN DEFAULT TRUE,
+            perm_scouts_report BOOLEAN DEFAULT TRUE,
+            perm_scouts_see_sensitive BOOLEAN DEFAULT FALSE,
+            perm_tourism_see_risk BOOLEAN DEFAULT TRUE,
+            updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP
+        );
+
 } catch (PDOException $e) {
     error_log('[WS-ZS] DDL: ' . $e->getMessage());
 }
@@ -207,8 +207,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['action'])) {
                     (zone_id, ai_enabled, ai_confidence_min, ai_auto_create_alert,
                      ai_auto_trigger_alarm, ai_detection_types, updated_at)
                 VALUES (?, ?, ?, ?, ?, ?, NOW())
-                ON DUPLICATE KEY UPDATE
-                    ai_enabled = VALUES(ai_enabled),
+                ON CONFLICT (ai_enabled) DO UPDATE SET ai_enabled = EXCLUDED.ai_enabled,
                     ai_confidence_min = VALUES(ai_confidence_min),
                     ai_auto_create_alert = VALUES(ai_auto_create_alert),
                     ai_auto_trigger_alarm = VALUES(ai_auto_trigger_alarm),
@@ -240,8 +239,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['action'])) {
                     (zone_id, cctv_retention_days, cctv_default_quality,
                      cctv_auto_record, cctv_snapshot_dir, updated_at)
                 VALUES (?, ?, ?, ?, ?, NOW())
-                ON DUPLICATE KEY UPDATE
-                    cctv_retention_days = VALUES(cctv_retention_days),
+                ON CONFLICT (cctv_retention_days) DO UPDATE SET cctv_retention_days = EXCLUDED.cctv_retention_days,
                     cctv_default_quality = VALUES(cctv_default_quality),
                     cctv_auto_record = VALUES(cctv_auto_record),
                     cctv_snapshot_dir = VALUES(cctv_snapshot_dir),
@@ -275,8 +273,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['action'])) {
                     (zone_id, alarm_default_type, alarm_siren_duration,
                      alarm_auto_stop, alarm_sms_blast, updated_at)
                 VALUES (?, ?, ?, ?, ?, NOW())
-                ON DUPLICATE KEY UPDATE
-                    alarm_default_type = VALUES(alarm_default_type),
+                ON CONFLICT (alarm_default_type) DO UPDATE SET alarm_default_type = EXCLUDED.alarm_default_type,
                     alarm_siren_duration = VALUES(alarm_siren_duration),
                     alarm_auto_stop = VALUES(alarm_auto_stop),
                     alarm_sms_blast = VALUES(alarm_sms_blast),
@@ -287,8 +284,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['action'])) {
             $pdo->prepare("
                 INSERT INTO zone_notification_settings (zone_id, alarm_delay_seconds, updated_at)
                 VALUES (?, ?, NOW())
-                ON DUPLICATE KEY UPDATE
-                    alarm_delay_seconds = VALUES(alarm_delay_seconds),
+                ON CONFLICT (alarm_delay_seconds) DO UPDATE SET alarm_delay_seconds = EXCLUDED.alarm_delay_seconds,
                     updated_at = NOW()
             ")->execute([$activeZoneId, $delay]);
 
@@ -327,8 +323,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['action'])) {
                      notif_on_incident, notif_on_ai_alert, notif_on_alarm,
                      notif_on_manpower, notif_offline_reminder, updated_at)
                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, NOW())
-                ON DUPLICATE KEY UPDATE
-                    notif_sms = VALUES(notif_sms),
+                ON CONFLICT (notif_sms) DO UPDATE SET notif_sms = EXCLUDED.notif_sms,
                     notif_email = VALUES(notif_email),
                     notif_push = VALUES(notif_push),
                     notif_on_incident = VALUES(notif_on_incident),
@@ -370,8 +365,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['action'])) {
                      perm_rangers_request_manpower, perm_scouts_report,
                      perm_scouts_see_sensitive, perm_tourism_see_risk, updated_at)
                 VALUES (?, ?, ?, ?, ?, ?, ?, NOW())
-                ON DUPLICATE KEY UPDATE
-                    perm_rangers_ack = VALUES(perm_rangers_ack),
+                ON CONFLICT (perm_rangers_ack) DO UPDATE SET perm_rangers_ack = EXCLUDED.perm_rangers_ack,
                     perm_rangers_trigger_alarm = VALUES(perm_rangers_trigger_alarm),
                     perm_rangers_request_manpower = VALUES(perm_rangers_request_manpower),
                     perm_scouts_report = VALUES(perm_scouts_report),

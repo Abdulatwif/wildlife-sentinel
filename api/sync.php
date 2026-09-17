@@ -1,4 +1,4 @@
-<?php
+﻿<?php
 // ============================================================
 // api/sync.php
 // Replay queued offline submissions.

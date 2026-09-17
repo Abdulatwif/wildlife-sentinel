@@ -1,4 +1,4 @@
-<?php
+﻿<?php
 // ============================================================
 // includes/functions.php
 // Wildlife Sentinel — Shared helper functions (v3.2)
@@ -326,9 +326,10 @@ if (!function_exists('createNotification')) {
             $stmt = $pdo->prepare("
                 INSERT INTO notifications (user_id, type, title, body, incident_id, message_id)
                 VALUES (?, ?, ?, ?, ?, ?)
-            ");
+                RETURNING id ");
             $stmt->execute([$userId, $type, $title, $body, $incidentId, $messageId]);
-            return $pdo->lastInsertId();
+            $row = $stmt->fetch(PDO::FETCH_ASSOC);
+            return $row ? (int)$row['id'] : false;
         } catch (PDOException $e) {
             error_log('[WS] createNotification: ' . $e->getMessage());
             return false;
@@ -489,9 +490,9 @@ if (!function_exists('countIncidentsByStatus')) {
 // TIME HELPERS
 // ============================================================
 if (!function_exists('timeAgo')) {
-    function timeAgo($datetime) {
-        if (empty($datetime)) return 'Never';
-        $time = strtotime($datetime);
+    function timeAgo($TIMESTAMP) {
+        if (empty($TIMESTAMP)) return 'Never';
+        $time = strtotime($TIMESTAMP);
         if (!$time) return 'Never';
         $now  = time();
         $diff = $now - $time;
@@ -517,13 +518,14 @@ if (!function_exists('logAudit')) {
             $stmt = $pdo->prepare("
                 INSERT INTO audit_logs (user_id, action, details, ip_address, user_agent)
                 VALUES (?, ?, ?, ?, ?)
-            ");
+                RETURNING id ");
             $ip = $_SERVER['REMOTE_ADDR'] ?? '0.0.0.0';
             $ua = $_SERVER['HTTP_USER_AGENT'] ?? 'Unknown';
             $detailsJson = $details ? json_encode($details) : null;
             $userId = ($userId > 0) ? $userId : null;
             $stmt->execute([$userId, $action, $detailsJson, $ip, $ua]);
-            return $pdo->lastInsertId();
+            $row = $stmt->fetch(PDO::FETCH_ASSOC);
+            return $row ? (int)$row['id'] : false;
         } catch (PDOException $e) { return false; }
     }
 }
@@ -553,9 +555,10 @@ if (!function_exists('sendMessage')) {
             $stmt = $pdo->prepare("
                 INSERT INTO messages (sender_id, recipient_id, incident_id, message_type, content, is_broadcast, created_at)
                 VALUES (?, ?, ?, ?, ?, ?, NOW())
-            ");
+                RETURNING id ");
             $stmt->execute([$senderId, $recipientId, $incidentId, $type, $content, $isBroadcast ? 1 : 0]);
-            return $pdo->lastInsertId();
+            $row = $stmt->fetch(PDO::FETCH_ASSOC);
+            return $row ? (int)$row['id'] : false;
         } catch (PDOException $e) { return false; }
     }
 }
@@ -616,9 +619,10 @@ if (!function_exists('sendUserMessage')) {
             $stmt = $pdo->prepare("
                 INSERT INTO messages (sender_id, recipient_id, incident_id, message_type, severity, content, created_at)
                 VALUES (?, ?, ?, ?, ?, ?, NOW())
-            ");
+                RETURNING id ");
             $stmt->execute([$senderId, $recipientId, $incidentId, $type, $severity, $content]);
-            $messageId = $pdo->lastInsertId();
+            $row = $stmt->fetch(PDO::FETCH_ASSOC);
+            $messageId = $row ? (int)$row['id'] : false;
             if ($recipientId) {
                 createNotification($recipientId, 'new_message', '📩 New Message', substr($content, 0, 100), $incidentId, $messageId);
             }
@@ -647,10 +651,10 @@ if (!function_exists('updateRangerAvailability')) {
             $stmt = $pdo->prepare("
                 INSERT INTO ranger_availability (ranger_id, is_available, current_incident_id, last_status_update)
                 VALUES (?, ?, ?, NOW())
-                ON DUPLICATE KEY UPDATE
-                    is_available = VALUES(is_available),
-                    current_incident_id = VALUES(current_incident_id),
-                    last_status_update = NOW()
+                ON CONFLICT (ranger_id) DO UPDATE SET
+                    is_available = EXCLUDED.is_available,
+                    current_incident_id = EXCLUDED.current_incident_id,
+                    last_status_update = NOW() RETURNING id
             ");
             return $stmt->execute([$rangerId, $isAvailable, $incidentId]);
         } catch (PDOException $e) { return false; }
@@ -696,7 +700,7 @@ if (!function_exists('getZoneStatistics')) {
                 SELECT
                     (SELECT COUNT(*) FROM incidents WHERE zone_id = ? AND status NOT IN ('resolved','closed')) as active_incidents,
                     (SELECT COUNT(*) FROM incidents WHERE zone_id = ? AND status = 'reported') as unacknowledged,
-                    (SELECT COUNT(*) FROM incidents WHERE zone_id = ? AND DATE(reported_at) = CURDATE()) as today_reports,
+                    (SELECT COUNT(*) FROM incidents WHERE zone_id = ? AND DATE() = CURRENT_DATE) as today_reports,
                     (SELECT COUNT(*) FROM ranger_availability ra JOIN users u ON ra.ranger_id = u.id WHERE u.zone_id = ? AND ra.is_available = 1) as available_rangers,
                     (SELECT COUNT(*) FROM users WHERE zone_id = ? AND role = 'ranger' AND is_active = 1) as total_rangers,
                     (SELECT COUNT(*) FROM incidents WHERE zone_id = ? AND media_urls IS NOT NULL) as incidents_with_photos
@@ -871,7 +875,7 @@ if (!function_exists('getAIDetectionStats')) {
                        SUM(CASE WHEN detection_type = 'human' THEN 1 ELSE 0 END) as humans,
                        SUM(CASE WHEN detection_type = 'animal' THEN 1 ELSE 0 END) as animals,
                        SUM(CASE WHEN detection_type = 'vehicle' THEN 1 ELSE 0 END) as vehicles,
-                       SUM(CASE WHEN DATE(detected_at) = CURDATE() THEN 1 ELSE 0 END) as today
+                       SUM(CASE WHEN DATE() = CURRENT_DATE THEN 1 ELSE 0 END) as today
                 FROM {$table} WHERE 1=1
             ";
             $params = [];
@@ -889,9 +893,10 @@ if (!function_exists('createAIAlert')) {
             $stmt = $pdo->prepare("
                 INSERT INTO ai_alerts (detection_id, zone_id, alert_type, severity, title, description, location_lat, location_lng, created_at)
                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, NOW())
-            ");
+                RETURNING id ");
             $stmt->execute([$detectionId, $zoneId, $alertType, $severity, $title, $description, $lat, $lng]);
-            return $pdo->lastInsertId();
+            $row = $stmt->fetch(PDO::FETCH_ASSOC);
+            return $row ? (int)$row['id'] : false;
         } catch (PDOException $e) { return false; }
     }
 }
@@ -917,7 +922,7 @@ if (!function_exists('acknowledgeAIAlert')) {
                 ->execute([$userId, $alertId]);
             $pdo->prepare("
                 UPDATE alarm_triggers SET stopped_at = NOW(),
-                    duration_seconds = TIMESTAMPDIFF(SECOND, triggered_at, NOW())
+                    duration_seconds = EXTRACT(EPOCH FROM NOW() - triggered_at)::INT
                 WHERE alert_id = ? AND stopped_at IS NULL
             ")->execute([$alertId]);
             return true;
@@ -980,7 +985,7 @@ if (!function_exists('stopAlarm')) {
             $pdo  = getDB();
             $stmt = $pdo->prepare("
                 UPDATE alarm_triggers SET stopped_at = NOW(),
-                    duration_seconds = TIMESTAMPDIFF(SECOND, triggered_at, NOW()),
+                    duration_seconds = EXTRACT(EPOCH FROM NOW() - triggered_at)::INT,
                     was_acknowledged = 1, acknowledged_by = ?, acknowledged_at = NOW()
                 WHERE id = ?
             ");
@@ -1105,7 +1110,7 @@ if (!function_exists('ws_log_sms')) {
             $stmt = $pdo->prepare("
                 INSERT INTO sms_logs
                     (user_id, phone, message, message_type, incident_id, alert_id, status, gateway_response, sent_at, created_at)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, {$sentAtSql}, NOW())
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, {$sentAtSql}, NOW()) RETURNING id
             ");
             $stmt->execute([$userId > 0 ? $userId : null, $phone, $message, $type, $incidentId, $alertId, $status, $res['error'] ?? null]);
         } catch (Throwable $e) {
@@ -1378,16 +1383,6 @@ if (!function_exists('checkRateLimit')) {
     function checkRateLimit($key, $maxAttempts = 5, $timeWindow = 300) {
         try {
             $pdo = getDB();
-            $pdo->exec("
-                CREATE TABLE IF NOT EXISTS rate_limits (
-                    id INT(11) AUTO_INCREMENT PRIMARY KEY,
-                    ip_address VARCHAR(45) NOT NULL,
-                    key_name VARCHAR(100) NOT NULL,
-                    attempt_count INT(11) DEFAULT 1,
-                    first_attempt DATETIME DEFAULT CURRENT_TIMESTAMP,
-                    INDEX idx_ip_key (ip_address, key_name)
-                )
-            ");
             $ip   = $_SERVER['REMOTE_ADDR'] ?? '0.0.0.0';
             $stmt = $pdo->prepare("SELECT attempt_count, first_attempt FROM rate_limits WHERE ip_address = ? AND key_name = ?");
             $stmt->execute([$ip, $key]);
@@ -1432,7 +1427,7 @@ if (!function_exists('getNearbyIncidents')) {
                 sin(radians(location_lat)))) AS distance
                 FROM incidents
                 WHERE status != 'resolved' AND status != 'closed'
-                HAVING distance < ?
+                HAVING (6371 * acos(cos(radians(?)) * cos(radians(location_lat)) * cos(radians(location_lng) - radians(?)) + sin(radians(?)) * sin(radians(location_lat)))) < ?
                 ORDER BY distance ASC, severity DESC
                 LIMIT ?
             ");
@@ -1463,8 +1458,8 @@ if (!function_exists('registerPark')) {
             $hash = hashPassword($supervisorData['password']);
             $stmt = $pdo->prepare("
                 INSERT INTO users (email, phone, password_hash, full_name, role, zone_id, created_by, is_active)
-                VALUES (?, ?, ?, ?, 'zone_supervisor', ?, ?, 1)
-            ");
+                VALUES (?, ?, ?, ?, 'zone_supervisor', ?, ?, TRUE)
+                RETURNING id ");
             $stmt->execute([
                 $supervisorData['email'],
                 $supervisorData['phone'] ?? null,
@@ -1473,7 +1468,8 @@ if (!function_exists('registerPark')) {
                 $zoneId,
                 $supervisorData['created_by'],
             ]);
-            $supervisorId = $pdo->lastInsertId();
+            $row = $stmt->fetch(PDO::FETCH_ASSOC);
+            $supervisorId = $row ? (int)$row['id'] : 0;
             $pdo->commit();
             return ['success'=>true,'supervisor_id'=>$supervisorId];
         } catch (Exception $e) {
@@ -1520,13 +1516,13 @@ if (!function_exists('updateZoneNotificationSettings')) {
                 INSERT INTO zone_notification_settings
                     (zone_id, sms_enabled, alarm_enabled, ai_detection_enabled, alarm_delay_seconds, ai_confidence_threshold, auto_create_incidents)
                 VALUES (?, ?, ?, ?, ?, ?, ?)
-                ON DUPLICATE KEY UPDATE
-                    sms_enabled = VALUES(sms_enabled),
-                    alarm_enabled = VALUES(alarm_enabled),
-                    ai_detection_enabled = VALUES(ai_detection_enabled),
-                    alarm_delay_seconds = VALUES(alarm_delay_seconds),
-                    ai_confidence_threshold = VALUES(ai_confidence_threshold),
-                    auto_create_incidents = VALUES(auto_create_incidents)
+                ON CONFLICT (zone_id) DO UPDATE SET
+                    sms_enabled = EXCLUDED.sms_enabled,
+                    alarm_enabled = EXCLUDED.alarm_enabled,
+                    ai_detection_enabled = EXCLUDED.ai_detection_enabled,
+                    alarm_delay_seconds = EXCLUDED.alarm_delay_seconds,
+                    ai_confidence_threshold = EXCLUDED.ai_confidence_threshold,
+                    auto_create_incidents = EXCLUDED.auto_create_incidents
             ");
             return $stmt->execute([
                 $zoneId,
@@ -1579,7 +1575,7 @@ if (!function_exists('getRangerLiveLocations')) {
             $stmt->execute([$zoneId]);
             $rangers = $stmt->fetchAll();
             foreach ($rangers as &$r) {
-                $rs = $pdo->prepare("SELECT lat, lng, heading, speed, timestamp FROM ranger_location_history WHERE ranger_id = ? AND timestamp >= DATE_SUB(NOW(), INTERVAL 2 HOUR) ORDER BY timestamp ASC");
+                $rs = $pdo->prepare("SELECT lat, lng, heading, speed, timestamp FROM ranger_location_history WHERE ranger_id = ? AND timestamp >= NOW() - INTERVAL '2 hours' ORDER BY timestamp ASC");
                 $rs->execute([$r['id']]);
                 $r['patrol_route'] = $rs->fetchAll();
             }
@@ -1595,7 +1591,7 @@ if (!function_exists('getAIAnomalies')) {
                 SELECT a.*, u.full_name AS subject_name, u.role AS subject_role
                 FROM ai_anomalies a
                 LEFT JOIN users u ON (a.ranger_id = u.id OR a.scout_id = u.id)
-                WHERE a.zone_id = ? AND a.detected_at >= DATE_SUB(NOW(), INTERVAL 24 HOUR)
+                WHERE a.zone_id = ? AND a.detected_at >= NOW() - INTERVAL '24 hours'
                 ORDER BY a.detected_at DESC LIMIT ?
             ");
             $stmt->execute([$zoneId, $limit]);
@@ -1635,8 +1631,12 @@ if (!function_exists('updateScoutLocation')) {
             $pdo = getDB();
             $pdo->prepare("
                 INSERT INTO scout_live_tracking (scout_id, current_lat, current_lng, last_update, is_offline)
-                VALUES (?, ?, ?, NOW(), 0)
-                ON DUPLICATE KEY UPDATE current_lat = VALUES(current_lat), current_lng = VALUES(current_lng), last_update = NOW(), is_offline = 0
+                VALUES (?, ?, ?, NOW(), FALSE)
+                ON CONFLICT (scout_id) DO UPDATE SET
+                    current_lat = EXCLUDED.current_lat,
+                    current_lng = EXCLUDED.current_lng,
+                    last_update = NOW(),
+                    is_offline = FALSE
             ")->execute([$scoutId, $lat, $lng]);
             $pdo->prepare("INSERT INTO scout_location_history (scout_id, lat, lng, timestamp) VALUES (?, ?, ?, NOW())")->execute([$scoutId, $lat, $lng]);
             $pdo->prepare("UPDATE users SET is_online = 1, last_seen = NOW() WHERE id = ?")->execute([$scoutId]);
@@ -1650,8 +1650,14 @@ if (!function_exists('updateRangerLocation')) {
             $pdo = getDB();
             $pdo->prepare("
                 INSERT INTO ranger_live_tracking (ranger_id, current_lat, current_lng, heading, speed, last_update, is_offline)
-                VALUES (?, ?, ?, ?, ?, NOW(), 0)
-                ON DUPLICATE KEY UPDATE current_lat = VALUES(current_lat), current_lng = VALUES(current_lng), heading = VALUES(heading), speed = VALUES(speed), last_update = NOW(), is_offline = 0
+                VALUES (?, ?, ?, ?, ?, NOW(), FALSE)
+                ON CONFLICT (ranger_id) DO UPDATE SET
+                    current_lat = EXCLUDED.current_lat,
+                    current_lng = EXCLUDED.current_lng,
+                    heading = EXCLUDED.heading,
+                    speed = EXCLUDED.speed,
+                    last_update = NOW(),
+                    is_offline = FALSE
             ")->execute([$rangerId, $lat, $lng, $heading, $speed]);
             $pdo->prepare("INSERT INTO ranger_location_history (ranger_id, lat, lng, heading, speed, incident_id, timestamp) VALUES (?, ?, ?, ?, ?, ?, NOW())")
                 ->execute([$rangerId, $lat, $lng, $heading, $speed, $incidentId]);
@@ -1694,9 +1700,10 @@ if (!function_exists('sendManpowerRequest')) {
             $stmt = $pdo->prepare("
                 INSERT INTO messages (sender_id, recipient_id, incident_id, message_type, subject, content, severity, is_broadcast, requires_acknowledgment, created_at)
                 VALUES (?, NULL, ?, 'manpower_request', ?, ?, ?, 1, 1, NOW())
-            ");
+                RETURNING id ");
             $stmt->execute([$rangerId, $incidentId, $subject, $content, $urgency === 'critical' ? 'critical' : 'high']);
-            $messageId = $pdo->lastInsertId();
+            $row = $stmt->fetch(PDO::FETCH_ASSOC);
+            $messageId = $row ? (int)$row['id'] : 0;
             $stmt = $pdo->prepare("SELECT id FROM users WHERE zone_id = ? AND role IN ('zone_supervisor','admin') AND is_active = 1");
             $stmt->execute([$incident['zone_id']]);
             foreach ($stmt->fetchAll(PDO::FETCH_COLUMN) as $uid) {
@@ -1727,9 +1734,10 @@ if (!function_exists('assignRangerToIncident')) {
             $stmt = $pdo->prepare("
                 INSERT INTO incident_assignments (incident_id, ranger_id, assigned_by, assigned_at, status, notes)
                 VALUES (?, ?, ?, NOW(), 'pending', ?)
-            ");
+                RETURNING id ");
             $stmt->execute([$incidentId, $rangerId, $assignedBy, $notes]);
-            return $pdo->lastInsertId();
+            $row = $stmt->fetch(PDO::FETCH_ASSOC);
+            return $row ? (int)$row['id'] : false;
         } catch (PDOException $e) { return false; }
     }
 }
@@ -1771,19 +1779,15 @@ if (!function_exists('createUser')) {
             $hash = hashPassword($data['password']);
             $stmt = $pdo->prepare("
                 INSERT INTO users (email, phone, password_hash, full_name, role, zone_id, badge_number, created_by, is_active)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, 1)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, 1) RETURNING id
             ");
             $stmt->execute([
-                $data['email'],
-                $data['phone'] ?? null,
-                $hash,
-                $data['full_name'],
-                $data['role'],
-                $data['zone_id'] ?? null,
-                $data['badge_number'] ?? null,
-                $createdBy,
+                $data['email'], $data['phone'] ?? null, $hash,
+                $data['full_name'], $data['role'],
+                $data['zone_id'] ?? null, $data['badge_number'] ?? null, $createdBy,
             ]);
-            return ['success'=>true,'user_id'=>$pdo->lastInsertId()];
+            $row = $stmt->fetch(PDO::FETCH_ASSOC);
+            return ['success'=>true,'user_id'=> $row ? (int)$row['id'] : 0];
         } catch (PDOException $e) {
             return ['success'=>false,'error'=>$e->getMessage()];
         }
@@ -1802,8 +1806,7 @@ if (!function_exists('updateUser')) {
             }
             if (empty($fields)) return ['success'=>false,'error'=>'No fields to update'];
             $params[] = $userId;
-            $pdo->prepare("UPDATE users SET " . implode(', ', $fields) . " WHERE id = ?")->execute($params);
-            return ['success'=>true];
+            $pdo->prepare("UPDATE users SET " . implode(', ', $fields) . " WHERE id = ?")->execute($params);            return ['success'=>true];
         } catch (PDOException $e) {
             return ['success'=>false,'error'=>$e->getMessage()];
         }
@@ -1849,7 +1852,7 @@ if (!function_exists('getZonePatrolStats')) {
                        MIN(rlh.timestamp) AS first_seen,
                        MAX(rlh.timestamp) AS last_seen
                 FROM users u
-                LEFT JOIN ranger_location_history rlh ON u.id = rlh.ranger_id AND rlh.timestamp >= DATE_SUB(NOW(), INTERVAL ? HOUR)
+                LEFT JOIN ranger_location_history rlh ON u.id = rlh.ranger_id AND rlh.timestamp >= NOW() - (? || ' hours')::INTERVAL
                 WHERE u.zone_id = ? AND u.role = 'ranger' AND u.is_active = 1
                 GROUP BY u.id ORDER BY gps_points DESC
             ");
@@ -1864,7 +1867,7 @@ if (!function_exists('getAIAnomalyStats')) {
             $pdo  = getDB();
             $stmt = $pdo->prepare("
                 SELECT type, severity, COUNT(*) AS count
-                FROM ai_anomalies WHERE zone_id = ? AND detected_at >= DATE_SUB(NOW(), INTERVAL ? HOUR)
+                FROM ai_anomalies WHERE zone_id = ? AND detected_at >= NOW() - (? || ' hours')::INTERVAL
                 GROUP BY type, severity ORDER BY count DESC
             ");
             $stmt->execute([$zoneId, $hours]);
@@ -1880,20 +1883,16 @@ if (!function_exists('logAIAnomaly')) {
                 INSERT INTO ai_anomalies
                     (zone_id, type, severity, description, confidence, location_lat, location_lng, radius_meters, ranger_id, scout_id, detected_at)
                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NOW())
-            ");
+                RETURNING id ");
             $stmt->execute([
-                $data['zone_id'],
-                $data['type'],
-                $data['severity'] ?? 'medium',
-                $data['description'] ?? null,
-                $data['confidence'] ?? 0.7,
-                $data['location_lat'],
-                $data['location_lng'],
+                $data['zone_id'], $data['type'], $data['severity'] ?? 'medium',
+                $data['description'] ?? null, $data['confidence'] ?? 0.7,
+                $data['location_lat'], $data['location_lng'],
                 $data['radius_meters'] ?? 200,
-                $data['ranger_id'] ?? null,
-                $data['scout_id'] ?? null,
+                $data['ranger_id'] ?? null, $data['scout_id'] ?? null,
             ]);
-            $anomalyId = $pdo->lastInsertId();
+            $row = $stmt->fetch(PDO::FETCH_ASSOC);
+            $anomalyId = $row ? (int)$row['id'] : false;
             broadcastToWS('ai-anomaly', array_merge($data, ['id' => $anomalyId]));
             return $anomalyId;
         } catch (PDOException $e) {

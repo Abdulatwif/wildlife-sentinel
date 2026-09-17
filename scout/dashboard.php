@@ -1,4 +1,4 @@
-<?php
+﻿<?php
 // ============================================================
 // scout/dashboard.php
 // Community Scout — Dashboard

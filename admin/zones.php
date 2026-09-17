@@ -1,4 +1,4 @@
-<?php
+﻿<?php
 // ============================================================
 // admin/zones.php
 // Wildlife Sentinel — Zone Management (Admin)
@@ -160,7 +160,7 @@ try {
                     (name, park_type, park_code, description, buffer_radius,
                      center_lat, center_lng, is_active, is_registered, created_at)
                 VALUES
-                    (?, ?, ?, ?, 500, ?, ?, 1, 0, NOW())
+                    (?, ?, ?, ?, 500, ?, ?, 1, 0, NOW()) RETURNING id
             ");
             $stmt->execute([$name, $type, $code, $desc, $lat, $lng]);
             $seededCount++;
@@ -336,7 +336,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['action'])) {
                         (name, park_type, park_code, description, buffer_radius,
                          center_lat, center_lng, is_active, is_registered, created_at)
                     VALUES
-                        (?, ?, ?, ?, ?, ?, ?, 1, 0, NOW())
+                        (?, ?, ?, ?, ?, ?, ?, 1, 0, NOW()) RETURNING id
                 ");
                 $stmt->execute([
                     $name,
@@ -347,7 +347,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['action'])) {
                     $centerLat,
                     $centerLng,
                 ]);
-                $newId = (int)$pdo->lastInsertId();
+                $newId = (int)($stmt->fetch()['id'] ?? 0);
                 logAudit($user['id'], 'create_zone', [
                     'zone_id'   => $newId,
                     'name'      => $name,

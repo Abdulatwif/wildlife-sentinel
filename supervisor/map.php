@@ -1,4 +1,4 @@
-<?php
+﻿<?php
 // ============================================================
 // supervisor/map.php
 // Zone Supervisor — Live Operational Map
@@ -131,7 +131,7 @@ function ws_fetchAIAnomalies(PDO $pdo, int $zoneId): array {
                u.full_name AS subject_name, u.role AS subject_role
         FROM ai_anomalies a
         LEFT JOIN users u ON (a.ranger_id = u.id OR a.scout_id = u.id)
-        WHERE a.zone_id = ? AND a.detected_at >= DATE_SUB(NOW(), INTERVAL 24 HOUR)
+        WHERE a.zone_id = ? AND a.detected_at >= NOW() - INTERVAL ' hours'
         ORDER BY a.detected_at DESC
         LIMIT 50
     ", [$zoneId]);
@@ -143,7 +143,7 @@ function ws_fetchPatrolRoutes(PDO $pdo, array $rangers): array {
         $routes[$r['id']] = safeFetchAll($pdo, "
             SELECT lat, lng, timestamp
             FROM ranger_location_history
-            WHERE ranger_id = ? AND timestamp >= DATE_SUB(NOW(), INTERVAL 2 HOUR)
+            WHERE ranger_id = ? AND timestamp >= NOW() - INTERVAL ' hours'
             ORDER BY timestamp ASC
         ", [$r['id']]);
     }

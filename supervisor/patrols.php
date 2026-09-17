@@ -1,4 +1,4 @@
-<?php
+﻿<?php
 // ============================================================
 // supervisor/patrols.php
 // Zone Supervisor — Patrol Routes & Coverage
@@ -89,7 +89,7 @@ $rangers = safeFetchAll($pdo, "
     SELECT u.id, u.full_name, u.badge_number, u.is_on_duty, u.is_online,
            rlt.current_lat, rlt.current_lng, rlt.last_update AS location_updated,
            ra.is_available,
-           (SELECT COUNT(*) FROM ranger_location_history rlh WHERE rlh.ranger_id = u.id AND rlh.timestamp >= DATE_SUB(NOW(), INTERVAL 24 HOUR)) AS gps_points_24h
+           (SELECT COUNT(*) FROM ranger_location_history rlh WHERE rlh.ranger_id = u.id AND rlh.timestamp >= NOW() - INTERVAL ' hours') AS gps_points_24h
     FROM users u
     LEFT JOIN ranger_live_tracking rlt ON u.id = rlt.ranger_id
     LEFT JOIN ranger_availability ra ON u.id = ra.ranger_id
