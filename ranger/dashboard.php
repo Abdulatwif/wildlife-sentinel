@@ -638,7 +638,7 @@ $animalSlides = [
 
                     <?php if (count($myIncidents) > 0): ?>
                         <?php foreach ($myIncidents as $inc): ?>
-                            <a href="incident.php?id=<?= (int)$inc['id'] ?>" class="incident-item <?= htmlspecialchars($inc['severity']) ?>">
+                            <a href="incidents.php?id=<?= (int)$inc['id'] ?>" class="incident-item <?= htmlspecialchars($inc['severity']) ?>">
                                 <div class="inc-icon">
                                     <?= function_exists('getCategoryIcon') ? getCategoryIcon($inc['category']) : '🚨' ?>
                                 </div>
@@ -678,7 +678,7 @@ $animalSlides = [
 
                     <?php if (count($zoneIncidents) > 0): ?>
                         <?php foreach ($zoneIncidents as $inc): ?>
-                            <a href="incident.php?id=<?= (int)$inc['id'] ?>" class="incident-item <?= htmlspecialchars($inc['severity']) ?>">
+                            <a href="incidents.php?id=<?= (int)$inc['id'] ?>" class="incident-item <?= htmlspecialchars($inc['severity']) ?>">
                                 <div class="inc-icon">
                                     <?= function_exists('getCategoryIcon') ? getCategoryIcon($inc['category']) : '🚨' ?>
                                 </div>
@@ -728,7 +728,7 @@ $animalSlides = [
                             <span class="icon">🆘</span>
                             <span class="label">Request Help</span>
                         </a>
-                        <a href="../messages.php" class="quick-tile">
+                        <a href="messages.php" class="quick-tile">
                             <span class="icon">💬</span>
                             <span class="label">Messages</span>
                             <?php if ($stats['unread_messages'] > 0): ?>

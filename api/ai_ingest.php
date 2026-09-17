@@ -10,7 +10,7 @@
 
 header('Content-Type: application/json');
 require_once __DIR__ . '/../includes/functions.php';
-require_once __DIR__ . '/../includes/ai_engine.php';
+require_once __DIR__ . '/../ai-service/ai_engine.php';
 
 // ------------------------------------------------------------
 // Auth

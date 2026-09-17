@@ -923,7 +923,7 @@ if (isset($_GET['sound'])) {
         console.log('📍 Incidents:', INCIDENTS.length);
         console.log('📍 AI anomalies:', AI_ANOM.length);
     </script>
-    <script src="../assets/js/ai-tracker.js"></script>
+    <script src="assets/js/ai-tracker.js"></script>
     <script>
         // Kick off AI anomaly polling (uses the ?ajax=ai_scan endpoint)
         if (window.AITracker && typeof window.AITracker.startAITracking === 'function') {

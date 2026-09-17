@@ -631,7 +631,7 @@ $activeAlarmList = safeFetchAll($pdo, "
                         <div class="section">
                             <div class="section-header">
                                 <h2>📋 Recent Incidents</h2>
-                                <a href="../incidents.php" class="view-all">View All →</a>
+                                <a href="incidents.php" class="view-all">View All →</a>
                             </div>
                             <?php if (count($recentIncidents) > 0): ?>
                                 <?php foreach ($recentIncidents as $incident): ?>
@@ -813,7 +813,7 @@ $activeAlarmList = safeFetchAll($pdo, "
                 <div class="section">
                     <div class="section-header"><h2>⚡ Quick Actions</h2></div>
                     <div class="stats-grid">
-                        <a href="../incidents.php" class="stat-card" style="text-decoration:none;cursor:pointer;">
+                        <a href="incidents.php" class="stat-card" style="text-decoration:none;cursor:pointer;">
                             <div class="icon red">🚨</div>
                             <div class="info"><div class="number"><?= $unacknowledged ?></div><div class="label">View Incidents</div></div>
                         </a>

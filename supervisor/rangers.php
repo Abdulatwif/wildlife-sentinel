@@ -638,7 +638,7 @@ $onDutyRangers = array_filter($rangers, function($r) { return $r['current_incide
                                     💬 Message
                                 </button>
                                 <?php if ($ranger['current_lat'] && $ranger['current_lng']): ?>
-                                <a href="../map.php?ranger=<?= $ranger['id'] ?>" class="btn-small btn-info">📍 View on Map</a>
+                                <a href="map.php?ranger=<?= $ranger['id'] ?>" class="btn-small btn-info">📍 View on Map</a>
                                 <?php endif; ?>
                             </div>
                         </div>

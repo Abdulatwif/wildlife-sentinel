@@ -1,6 +1,6 @@
 <?php
 header('Content-Type: application/json');
-require_once '../includes/functions.php');
+require_once '../includes/functions.php';
 requireLogin();
 
 $pdo = getDB();

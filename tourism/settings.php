@@ -736,7 +736,7 @@ $profileStats = [
                                 • Account created: <b><?= $profileStats['member_since'] ? date('M j, Y', strtotime($profileStats['member_since'])) : '—' ?></b>
                             </div>
                             <div style="margin-top:14px;">
-                                <a href="<?= $rootPrefix ?? '' ?>tourism/logout.php" class="btn btn-danger" style="width:100%;justify-content:center;"
+                                <a href="<?= $rootPrefix ?? '' ?>logout.php" class="btn btn-danger" style="width:100%;justify-content:center;"
                                    onclick="return confirm('Log out of your account?')">
                                     <i class="fas fa-sign-out-alt"></i> Log Out
                                 </a>

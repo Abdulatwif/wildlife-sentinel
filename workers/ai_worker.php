@@ -12,7 +12,7 @@
 // ============================================================
 
 require_once __DIR__ . '/../includes/functions.php';
-require_once __DIR__ . '/../includes/ai_engine.php';
+require_once __DIR__ . '/../ai-service/ai_engine.php';
 
 $once   = in_array('--once', $argv ?? [], true);
 $dryRun = getenv('WS_AI_DRY_RUN') === '1';

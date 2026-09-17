@@ -1,6 +1,6 @@
 <?php
 // ============================================================
-// includes/ai_engine.php
+// ai-service/ai_engine.php
 // Wildlife Sentinel — Advanced AI Analysis Engine (v2)
 // ------------------------------------------------------------
 // Pipeline stages (in order):
@@ -22,7 +22,7 @@
 // All DB operations are guarded; missing tables degrade gracefully.
 // ============================================================
 
-require_once __DIR__ . '/functions.php';
+require_once __DIR__ . '/../includes/functions.php';
 
 if (!class_exists('AIEngine')) {
 
