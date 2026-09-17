@@ -1,9 +1,7 @@
 FROM php:8.2-apache
 
-# Install PostgreSQL PDO extension (required for Supabase)
-RUN apt-get update && apt-get install -y libpq-dev \
-    && docker-php-ext-install pdo pdo_pgsql \
-    && apt-get clean && rm -rf /var/lib/apt/lists/*
+# Install PDO MySQL extension (required for TiDB Cloud)
+RUN docker-php-ext-install pdo pdo_mysql
 
 # Enable Apache mod_rewrite for .htaccess support
 RUN a2enmod rewrite
