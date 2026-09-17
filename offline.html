@@ -1,0 +1,381 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+    <meta name="theme-color" content="#0d3b22">
+    <title>Offline — Wildlife Sentinel</title>
+    <link rel="icon" href="https://encrypted-tbn0.gstatic.com/images?q=tbn:ANd9GcSNUo8sFW1IUxMnFDN_ZE2dSEegfrRcFqyzgZfg1L2I1g&s">
+    <link href="https://fonts.googleapis.com/css2?family=Fraunces:opsz,wght@9..144,700;9..144,800&family=Inter:wght@300;400;600;700&display=swap" rel="stylesheet">
+    <style>
+        * { margin: 0; padding: 0; box-sizing: border-box; }
+
+        body {
+            font-family: 'Inter', -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+            min-height: 100vh;
+            min-height: 100dvh;
+            background: linear-gradient(135deg, #0a1a0f 0%, #1a5c3a 50%, #0d3b22 100%);
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            padding: 20px;
+            color: white;
+            position: relative;
+            overflow: hidden;
+        }
+
+        body::before {
+            content: '';
+            position: absolute; inset: 0;
+            background:
+                radial-gradient(circle at 20% 50%, rgba(74,222,128,0.06) 0%, transparent 50%),
+                radial-gradient(circle at 80% 50%, rgba(74,222,128,0.06) 0%, transparent 50%);
+            z-index: 0;
+        }
+
+        /* Floating wildlife */
+        .animals-bg {
+            position: fixed; inset: 0; z-index: 0;
+            overflow: hidden; pointer-events: none;
+        }
+        .animal {
+            position: absolute; font-size: 40px;
+            animation: floatAnimal linear infinite;
+            opacity: 0.1;
+        }
+        .animal:nth-child(1) { top: 8%;  left: 6%;   font-size: 50px; animation-duration: 22s; }
+        .animal:nth-child(2) { top: 20%; right: 8%;  font-size: 34px; animation-duration: 26s; animation-delay: 2s; }
+        .animal:nth-child(3) { bottom: 15%; left: 10%; font-size: 42px; animation-duration: 28s; animation-delay: 3s; }
+        .animal:nth-child(4) { bottom: 25%; right: 6%; font-size: 30px; animation-duration: 24s; animation-delay: 1s; }
+        .animal:nth-child(5) { top: 45%; left: 8%;   font-size: 26px; animation-duration: 20s; animation-delay: 4s; }
+        .animal:nth-child(6) { top: 60%; right: 12%; font-size: 36px; animation-duration: 30s; animation-delay: 5s; }
+        .animal:nth-child(7) { top: 30%; left: 46%;  font-size: 24px; animation-duration: 18s; animation-delay: 2s; }
+        .animal:nth-child(8) { bottom: 40%; left: 42%; font-size: 28px; animation-duration: 27s; animation-delay: 4s; }
+
+        @keyframes floatAnimal {
+            0%   { transform: translate(0,0) rotate(0deg); opacity: 0.08; }
+            25%  { transform: translate(80px,-40px) rotate(8deg); opacity: 0.14; }
+            50%  { transform: translate(160px,25px) rotate(-4deg); opacity: 0.18; }
+            75%  { transform: translate(80px,40px) rotate(6deg); opacity: 0.14; }
+            100% { transform: translate(0,0) rotate(0deg); opacity: 0.08; }
+        }
+
+        .card {
+            position: relative;
+            z-index: 1;
+            background: rgba(255,255,255,0.06);
+            backdrop-filter: blur(20px);
+            -webkit-backdrop-filter: blur(20px);
+            border: 1px solid rgba(255,255,255,0.1);
+            border-radius: 24px;
+            max-width: 480px;
+            width: 100%;
+            padding: 40px 32px 32px;
+            text-align: center;
+            box-shadow: 0 20px 60px rgba(0,0,0,0.5);
+            animation: slideUp 0.5s ease;
+        }
+        @keyframes slideUp {
+            from { opacity: 0; transform: translateY(24px); }
+            to   { opacity: 1; transform: translateY(0); }
+        }
+
+        .offline-pill {
+            display: inline-flex;
+            align-items: center;
+            gap: 8px;
+            padding: 6px 14px;
+            background: rgba(250,204,21,0.15);
+            border: 1px solid rgba(250,204,21,0.35);
+            border-radius: 50px;
+            color: #facc15;
+            font-size: 11px;
+            font-weight: 700;
+            letter-spacing: 1.2px;
+            text-transform: uppercase;
+            margin-bottom: 18px;
+        }
+        .offline-pill::before {
+            content: '';
+            width: 6px; height: 6px;
+            border-radius: 50%;
+            background: #facc15;
+            box-shadow: 0 0 10px #facc15;
+            animation: pulse 1.8s infinite;
+        }
+        @keyframes pulse { 0%,100% { opacity: 1; } 50% { opacity: 0.4; } }
+
+        .offline-icon {
+            font-size: 72px;
+            margin-bottom: 12px;
+            display: block;
+            animation: bob 3s ease-in-out infinite;
+        }
+        @keyframes bob {
+            0%,100% { transform: translateY(0); }
+            50%     { transform: translateY(-6px); }
+        }
+
+        h1 {
+            font-family: 'Fraunces', serif;
+            font-size: 26px;
+            font-weight: 800;
+            letter-spacing: -0.5px;
+            color: white;
+            margin-bottom: 8px;
+        }
+        h1 .highlight {
+            background: linear-gradient(135deg, #4ade80, #22d3ee);
+            -webkit-background-clip: text;
+            -webkit-text-fill-color: transparent;
+            background-clip: text;
+        }
+
+        .subtitle {
+            color: rgba(255,255,255,0.55);
+            font-size: 13px;
+            line-height: 1.6;
+            margin-bottom: 22px;
+        }
+
+        /* Status panel */
+        .status-grid {
+            display: grid;
+            grid-template-columns: 1fr 1fr;
+            gap: 8px;
+            margin-bottom: 22px;
+        }
+        .status-tile {
+            background: rgba(255,255,255,0.04);
+            border: 1px solid rgba(255,255,255,0.08);
+            border-radius: 12px;
+            padding: 12px 14px;
+            text-align: left;
+            font-size: 12px;
+            color: rgba(255,255,255,0.75);
+            display: flex;
+            gap: 8px;
+            align-items: flex-start;
+            transition: background 0.2s;
+        }
+        .status-tile:hover { background: rgba(255,255,255,0.07); }
+        .status-tile .st-icon { font-size: 16px; flex-shrink: 0; line-height: 1.3; }
+        .status-tile .st-body { min-width: 0; }
+        .status-tile .st-title { color: white; font-weight: 600; display: block; margin-bottom: 2px; font-size: 12px; }
+        .status-tile .st-text  { color: rgba(255,255,255,0.5); font-size: 11px; line-height: 1.4; }
+
+        /* Queued count banner */
+        .queue-banner {
+            display: none;
+            background: rgba(34,197,94,0.12);
+            border: 1px solid rgba(34,197,94,0.28);
+            border-radius: 12px;
+            padding: 12px 14px;
+            margin-bottom: 18px;
+            font-size: 12.5px;
+            color: #86efac;
+            text-align: left;
+            line-height: 1.5;
+            align-items: flex-start;
+            gap: 10px;
+        }
+        .queue-banner.show { display: flex; }
+        .queue-banner .qb-icon { font-size: 20px; flex-shrink: 0; }
+        .queue-banner strong { color: #4ade80; display: block; margin-bottom: 2px; }
+
+        .btn-row {
+            display: flex;
+            gap: 10px;
+            flex-wrap: wrap;
+            justify-content: center;
+        }
+
+        .btn {
+            display: inline-flex;
+            align-items: center;
+            justify-content: center;
+            gap: 8px;
+            padding: 12px 24px;
+            border: none;
+            border-radius: 12px;
+            font-size: 14px;
+            font-weight: 600;
+            font-family: inherit;
+            text-decoration: none;
+            cursor: pointer;
+            transition: all 0.25s;
+            min-height: 46px;
+        }
+        .btn-primary {
+            background: linear-gradient(135deg, #1a5c3a, #2d8a4e);
+            color: white;
+            box-shadow: 0 4px 24px rgba(26,92,58,0.35);
+        }
+        .btn-primary:hover {
+            transform: translateY(-2px);
+            box-shadow: 0 8px 32px rgba(26,92,58,0.5);
+        }
+        .btn-ghost {
+            background: rgba(255,255,255,0.06);
+            color: white;
+            border: 1px solid rgba(255,255,255,0.14);
+        }
+        .btn-ghost:hover { background: rgba(255,255,255,0.12); }
+
+        .footer-note {
+            margin-top: 24px;
+            padding-top: 18px;
+            border-top: 1px solid rgba(255,255,255,0.08);
+            font-size: 11px;
+            color: rgba(255,255,255,0.35);
+            line-height: 1.6;
+        }
+
+        /* Detect the browser's online status in real time */
+        .online-hint {
+            display: none;
+            margin-top: 12px;
+            font-size: 12px;
+            color: #4ade80;
+        }
+        .online-hint.show { display: block; }
+
+        @media (max-width: 480px) {
+            .card { padding: 32px 22px 26px; border-radius: 18px; }
+            .offline-icon { font-size: 60px; }
+            h1 { font-size: 22px; }
+            .status-grid { grid-template-columns: 1fr; }
+            .btn-row { flex-direction: column; }
+            .btn { width: 100%; }
+        }
+    </style>
+</head>
+<body>
+    <div class="animals-bg">
+        <span class="animal">🦁</span>
+        <span class="animal">🐘</span>
+        <span class="animal">🦒</span>
+        <span class="animal">🦏</span>
+        <span class="animal">🐆</span>
+        <span class="animal">🦓</span>
+        <span class="animal">🦅</span>
+        <span class="animal">🐾</span>
+    </div>
+
+    <div class="card">
+        <span class="offline-pill">No Connection</span>
+        <span class="offline-icon">📡</span>
+        <h1>You're <span class="highlight">Offline</span></h1>
+        <p class="subtitle">
+            Wildlife Sentinel will keep working. Anything you record now is queued
+            and will sync automatically when you're back online.
+        </p>
+
+        <!-- What still works -->
+        <div class="status-grid">
+            <div class="status-tile">
+                <span class="st-icon">📝</span>
+                <div class="st-body">
+                    <span class="st-title">Reports queued</span>
+                    <span class="st-text">New incidents are saved and synced later.</span>
+                </div>
+            </div>
+            <div class="status-tile">
+                <span class="st-icon">🗺️</span>
+                <div class="st-body">
+                    <span class="st-title">Map cached</span>
+                    <span class="st-text">Last viewed map area is available.</span>
+                </div>
+            </div>
+            <div class="status-tile">
+                <span class="st-icon">📄</span>
+                <div class="st-body">
+                    <span class="st-title">Dashboard views</span>
+                    <span class="st-text">Previously opened pages still work.</span>
+                </div>
+            </div>
+            <div class="status-tile">
+                <span class="st-icon">🔔</span>
+                <div class="st-body">
+                    <span class="st-title">Notifications</span>
+                    <span class="st-text">Delivered after reconnecting.</span>
+                </div>
+            </div>
+        </div>
+
+        <!-- Shown if the browser has queued work -->
+        <div class="queue-banner" id="queueBanner">
+            <span class="qb-icon">📤</span>
+            <div>
+                <strong>Queued submissions waiting to sync</strong>
+                <span id="queueCount">0 items in the offline queue. They'll be sent automatically once you reconnect.</span>
+            </div>
+        </div>
+
+        <div class="btn-row">
+            <button class="btn btn-primary" onclick="retryConnection()">🔄 Try Again</button>
+            <button class="btn btn-ghost" onclick="goBack()">← Go Back</button>
+        </div>
+
+        <div class="online-hint" id="onlineHint">
+            ✅ You're back online! Reloading…
+        </div>
+
+        <div class="footer-note">
+            © <span id="year"></span> Wildlife Sentinel — Protecting Zambia's Wildlife
+        </div>
+    </div>
+
+    <script>
+        document.getElementById('year').textContent = new Date().getFullYear();
+
+        function retryConnection() {
+            // Prefer reloading the page the user came from
+            const back = sessionStorage.getItem('ws_last_page');
+            if (navigator.onLine) {
+                window.location.href = back || '/';
+            } else {
+                location.reload();
+            }
+        }
+
+        function goBack() {
+            if (window.history.length > 1) {
+                window.history.back();
+            } else {
+                window.location.href = '/';
+            }
+        }
+
+        // Detect when connection comes back
+        window.addEventListener('online', () => {
+            document.getElementById('onlineHint').classList.add('show');
+            // Small delay so the user sees the message
+            setTimeout(() => {
+                const back = sessionStorage.getItem('ws_last_page');
+                window.location.href = back || '/';
+            }, 900);
+        });
+
+        // Read the offline queue count (populated by offline-manager.js)
+        function updateQueueCount() {
+            try {
+                const raw = localStorage.getItem('ws_offline_queue');
+                const arr = raw ? JSON.parse(raw) : [];
+                const count = Array.isArray(arr) ? arr.length : 0;
+                const banner = document.getElementById('queueBanner');
+                const txt = document.getElementById('queueCount');
+                if (count > 0) {
+                    banner.classList.add('show');
+                    txt.textContent = count + ' item' + (count === 1 ? '' : 's') +
+                        ' in the offline queue. They will be sent automatically once you reconnect.';
+                } else {
+                    banner.classList.remove('show');
+                }
+            } catch (e) { /* ignore */ }
+        }
+        updateQueueCount();
+        setInterval(updateQueueCount, 3000);
+    </script>
+</body>
+</html>

@@ -1,0 +1,217 @@
+# ============================================================
+# Wildlife Sentinel — .htaccess
+# ------------------------------------------------------------
+# Works on Apache 2.2 and 2.4.
+# Handles: URL rewriting, directory protection, HTTPS,
+# security headers, caching, compression, PWA MIME types.
+# ============================================================
+
+# ------------------------------------------------------------
+# BASIC
+# ------------------------------------------------------------
+RewriteEngine On
+Options -Indexes
+AddDefaultCharset UTF-8
+
+# ------------------------------------------------------------
+# FORCE HTTPS
+# ------------------------------------------------------------
+# Service workers (offline/PWA) only register on HTTPS, so
+# this is required for the Wildlife Sentinel offline setup.
+<IfModule mod_rewrite.c>
+    RewriteCond %{HTTPS} !=on
+    RewriteCond %{HTTP:X-Forwarded-Proto} !https
+    RewriteCond %{HTTP_HOST} !^localhost(:[0-9]+)?$ [NC]
+    RewriteCond %{HTTP_HOST} !^127\.0\.0\.1(:[0-9]+)?$ [NC]
+    RewriteRule ^ https://%{HTTP_HOST}%{REQUEST_URI} [R=301,L]
+</IfModule>
+
+# ------------------------------------------------------------
+# PROTECT SENSITIVE FILES
+# ------------------------------------------------------------
+# Block .htaccess, .env, .git and other dot-files at the root
+<FilesMatch "^\.">
+    <IfModule mod_authz_core.c>
+        Require all denied
+    </IfModule>
+    <IfModule !mod_authz_core.c>
+        Order allow,deny
+        Deny from all
+    </IfModule>
+</FilesMatch>
+
+# Block config.php and known project secrets (only at root level)
+<FilesMatch "^(config\.php|composer\.(json|lock)|package\.(json|lock)|\.env.*)$">
+    <IfModule mod_authz_core.c>
+        Require all denied
+    </IfModule>
+    <IfModule !mod_authz_core.c>
+        Order allow,deny
+        Deny from all
+    </IfModule>
+</FilesMatch>
+
+# Block .sql, .log, .ini files anywhere in the project
+<FilesMatch "\.(sql|log|ini)$">
+    <IfModule mod_authz_core.c>
+        Require all denied
+    </IfModule>
+    <IfModule !mod_authz_core.c>
+        Order allow,deny
+        Deny from all
+    </IfModule>
+</FilesMatch>
+
+# Block direct access to the config/ folder entirely
+<IfModule mod_rewrite.c>
+    RewriteRule ^config/ - [F,L]
+    RewriteRule ^includes/ - [F,L]
+    RewriteRule ^logs/ - [F,L]
+</IfModule>
+
+# Block PHP execution inside the uploads folder
+# (users should never be able to upload a script and run it)
+<IfModule mod_rewrite.c>
+    RewriteRule ^uploads/.*\.(php|phtml|php3|php4|php5|php7|pl|py|jsp|asp|sh|cgi)$ - [F,L]
+</IfModule>
+
+# ------------------------------------------------------------
+# URL REWRITING (SPA-style fallback — optional)
+# ------------------------------------------------------------
+<IfModule mod_rewrite.c>
+    RewriteBase /wildlife-sentinel/
+
+    # Don't rewrite real files or directories
+    RewriteCond %{REQUEST_FILENAME} -f [OR]
+    RewriteCond %{REQUEST_FILENAME} -d
+    RewriteRule ^ - [L]
+</IfModule>
+
+# ------------------------------------------------------------
+# ERROR PAGES
+# ------------------------------------------------------------
+ErrorDocument 403 /wildlife-sentinel/403.php
+ErrorDocument 404 /wildlife-sentinel/404.php
+ErrorDocument 500 /wildlife-sentinel/500.php
+
+# ------------------------------------------------------------
+# PWA / MIME TYPES
+# ------------------------------------------------------------
+<IfModule mod_mime.c>
+    AddType application/manifest+json .webmanifest
+    AddType application/javascript       .js
+    AddType text/css                     .css
+    AddType image/svg+xml                .svg
+</IfModule>
+
+# ------------------------------------------------------------
+# SECURITY HEADERS
+# ------------------------------------------------------------
+<IfModule mod_headers.c>
+    # Prevent MIME sniffing
+    Header set X-Content-Type-Options "nosniff"
+
+    # Prevent clickjacking (except when embedding Leaflet tiles is required — none here)
+    Header set X-Frame-Options "DENY"
+
+    # Legacy XSS filter (browsers ignore when CSP is set)
+    Header set X-XSS-Protection "1; mode=block"
+
+    # Referrer
+    Header set Referrer-Policy "strict-origin-when-cross-origin"
+
+    # Permissions — disable features we don't use
+    Header set Permissions-Policy "camera=(), microphone=(), geolocation=(self), payment=()"
+
+    # Cross-origin isolation (off by default; enable if you use SharedArrayBuffer)
+    Header set Cross-Origin-Opener-Policy "same-origin"
+    Header set Cross-Origin-Resource-Policy "same-origin"
+
+    # Service worker must always be revalidated
+    <FilesMatch "^sw\.js$">
+        Header set Cache-Control "no-cache, no-store, must-revalidate"
+        Header set Service-Worker-Allowed "/"
+    </FilesMatch>
+
+    # Never cache the manifest
+    <FilesMatch "\.webmanifest$">
+        Header set Cache-Control "no-cache, must-revalidate"
+    </FilesMatch>
+
+    # Do not cache PHP or JSON responses
+    <FilesMatch "\.(php|json)$">
+        Header set Cache-Control "no-store, no-cache, must-revalidate"
+    </FilesMatch>
+
+    # Content-Security-Policy in REPORT-ONLY mode
+    # Browser logs violations but does NOT block anything.
+    # Change "Content-Security-Policy-Report-Only" to
+    # "Content-Security-Policy" once you've verified the reports.
+    Header set Content-Security-Policy-Report-Only "\
+        default-src 'self'; \
+        script-src 'self' 'unsafe-inline' 'unsafe-eval' https://unpkg.com https://cdnjs.cloudflare.com https://cdn.socket.io; \
+        style-src 'self' 'unsafe-inline' https://fonts.googleapis.com https://unpkg.com https://cdnjs.cloudflare.com; \
+        font-src 'self' https://fonts.gstatic.com data:; \
+        img-src 'self' data: blob: https://unpkg.com https://*.tile.openstreetmap.org https://server.arcgisonline.com https://*.basemaps.cartocdn.com https://encrypted-tbn0.gstatic.com; \
+        connect-src 'self' ws: wss: http://localhost:3001 https://api.mtn.com https://iqsms.airtel.in https://api.esmsafrica.io; \
+        frame-ancestors 'none'; \
+        base-uri 'self'; \
+        form-action 'self';"
+</IfModule>
+
+# ------------------------------------------------------------
+# CACHE STATIC ASSETS
+# ------------------------------------------------------------
+<IfModule mod_expires.c>
+    ExpiresActive On
+
+    # Images
+    ExpiresByType image/jpg              "access plus 1 year"
+    ExpiresByType image/jpeg             "access plus 1 year"
+    ExpiresByType image/gif              "access plus 1 year"
+    ExpiresByType image/png              "access plus 1 year"
+    ExpiresByType image/webp             "access plus 1 year"
+    ExpiresByType image/svg+xml          "access plus 1 year"
+    ExpiresByType image/x-icon           "access plus 1 year"
+
+    # Fonts
+    ExpiresByType font/woff              "access plus 1 year"
+    ExpiresByType font/woff2             "access plus 1 year"
+    ExpiresByType application/font-woff  "access plus 1 year"
+    ExpiresByType application/font-woff2 "access plus 1 year"
+
+    # Code
+    ExpiresByType text/css               "access plus 1 month"
+    ExpiresByType application/javascript "access plus 1 month"
+    ExpiresByType text/javascript        "access plus 1 month"
+    ExpiresByType application/x-javascript "access plus 1 month"
+
+    # Don't cache HTML / PHP / JSON / manifest / service worker
+    ExpiresByType text/html              "access plus 0 seconds"
+    ExpiresByType application/json       "access plus 0 seconds"
+    ExpiresByType application/manifest+json "access plus 0 seconds"
+</IfModule>
+
+# ------------------------------------------------------------
+# COMPRESS TEXT FILES
+# ------------------------------------------------------------
+<IfModule mod_deflate.c>
+    AddOutputFilterByType DEFLATE text/html
+    AddOutputFilterByType DEFLATE text/css
+    AddOutputFilterByType DEFLATE text/plain
+    AddOutputFilterByType DEFLATE text/xml
+    AddOutputFilterByType DEFLATE text/javascript
+    AddOutputFilterByType DEFLATE application/javascript
+    AddOutputFilterByType DEFLATE application/x-javascript
+    AddOutputFilterByType DEFLATE application/json
+    AddOutputFilterByType DEFLATE application/xml
+    AddOutputFilterByType DEFLATE application/manifest+json
+    AddOutputFilterByType DEFLATE image/svg+xml
+
+    # Some older browsers choke on certain content types
+    <IfModule mod_setenvif.c>
+        BrowserMatch ^Mozilla/4 gzip-only-text/html
+        BrowserMatch ^Mozilla/4\.0[678] no-gzip
+        BrowserMatch \bMSIE !no-gzip !gzip-only-text/html
+    </IfModule>
+</IfModule>

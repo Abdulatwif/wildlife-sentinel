@@ -1,0 +1,25 @@
+{
+  "name": "Wildlife Sentinel",
+  "short_name": "Sentinel",
+  "description": "Zambia Wildlife Protection System — report incidents offline and sync when back online.",
+  "start_url": "./login.php",
+  "scope": "./",
+  "display": "standalone",
+  "orientation": "portrait",
+  "background_color": "#0d3b22",
+  "theme_color": "#0d3b22",
+  "icons": [
+    {
+      "src": "https://encrypted-tbn0.gstatic.com/images?q=tbn:ANd9GcSNUo8sFW1IUxMnFDN_ZE2dSEegfrRcFqyzgZfg1L2I1g&s",
+      "sizes": "192x192",
+      "type": "image/png",
+      "purpose": "any maskable"
+    },
+    {
+      "src": "https://encrypted-tbn0.gstatic.com/images?q=tbn:ANd9GcSNUo8sFW1IUxMnFDN_ZE2dSEegfrRcFqyzgZfg1L2I1g&s",
+      "sizes": "512x512",
+      "type": "image/png",
+      "purpose": "any maskable"
+    }
+  ]
+}

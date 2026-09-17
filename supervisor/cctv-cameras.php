@@ -1,0 +1,766 @@
+<?php
+// ============================================================
+// supervisor/cctv-cameras.php
+// Zone Supervisor — CCTV Camera Management (zone-scoped)
+// ------------------------------------------------------------
+// Honors global + zone settings:
+//   cctv_retention_days, cctv_snapshot_dir, items_per_page
+// ============================================================
+
+error_reporting(E_ALL);
+ini_set('display_errors', '0');
+ini_set('log_errors', '1');
+
+require_once __DIR__ . '/../includes/functions.php';
+requireLogin();
+
+if (!function_exists('hasRole') || !hasRole('zone_supervisor')) {
+    header('Location: ../index.php');
+    exit();
+}
+
+$user         = getCurrentUser();
+$pdo          = getDB();
+$activeZoneId = (int)($user['zone_id'] ?? 0);
+
+// ============================================================
+// GLOBAL SETTINGS
+// ============================================================
+if (!function_exists('ws_cam_global')) {
+    function ws_cam_global(string $key, $default = null) {
+        if (function_exists('getSetting')) {
+            $v = getSetting($key);
+            return $v !== null ? $v : $default;
+        }
+        try {
+            $stmt = getDB()->prepare("SELECT setting_value FROM settings WHERE setting_key = ? LIMIT 1");
+            $stmt->execute([$key]);
+            $row = $stmt->fetch();
+            return $row ? $row['setting_value'] : $default;
+        } catch (PDOException $e) {
+            return $default;
+        }
+    }
+}
+
+$globalAiEnabled       = (string) ws_cam_global('ai_enabled', '1')             === '1';
+$globalCctvRetention   = (int)    ws_cam_global('cctv_retention_days', 30);
+$globalCctvSnapshotDir = (string) ws_cam_global('cctv_snapshot_dir', 'uploads/cctv/');
+$globalItemsPerPage    = (int)    ws_cam_global('items_per_page', 25);
+if ($globalItemsPerPage < 5 || $globalItemsPerPage > 100) $globalItemsPerPage = 25;
+
+// ============================================================
+// SAFE HELPERS
+// ============================================================
+if (!function_exists('safeCount')) {
+    function safeCount(PDO $pdo, string $sql, array $params = []): int {
+        try {
+            $stmt = $pdo->prepare($sql);
+            $stmt->execute($params);
+            return (int)($stmt->fetch()['count'] ?? 0);
+        } catch (PDOException $e) { return 0; }
+    }
+}
+if (!function_exists('safeFetchAll')) {
+    function safeFetchAll(PDO $pdo, string $sql, array $params = []): array {
+        try {
+            $stmt = $pdo->prepare($sql);
+            $stmt->execute($params);
+            return $stmt->fetchAll();
+        } catch (PDOException $e) { return []; }
+    }
+}
+if (!function_exists('ws_cam_validate_url')) {
+    function ws_cam_validate_url(?string $url): array {
+        $url = trim((string)$url);
+        if ($url === '') return ['ok' => true, 'scheme' => null];
+        $p = parse_url($url);
+        if (!$p || empty($p['scheme'])) return ['ok' => false, 'error' => 'Missing scheme'];
+        $scheme = strtolower($p['scheme']);
+        if (!in_array($scheme, ['rtsp','rtsps','http','https'], true)) {
+            return ['ok' => false, 'error' => 'Unsupported scheme: ' . $scheme];
+        }
+        return ['ok' => true, 'scheme' => $scheme];
+    }
+}
+if (!function_exists('ws_cam_sanitize_dir')) {
+    function ws_cam_sanitize_dir(string $dir): string {
+        $dir = trim($dir);
+        $dir = preg_replace('#\.\.+#', '', $dir);
+        $dir = preg_replace('#[^a-zA-Z0-9/_\-]#', '', $dir);
+        $dir = trim($dir, '/');
+        if ($dir === '' || strpos($dir, 'uploads/') !== 0) return 'uploads/cctv/';
+        return $dir . '/';
+    }
+}
+
+// ============================================================
+// AUTO-CREATE cctv_cameras
+// ============================================================
+try {
+    $pdo->exec("
+        CREATE TABLE IF NOT EXISTS cctv_cameras (
+            id INT(11) AUTO_INCREMENT PRIMARY KEY,
+            zone_id INT(11) NOT NULL,
+            camera_name VARCHAR(255) NOT NULL,
+            camera_code VARCHAR(50) NULL,
+            stream_url VARCHAR(500) NULL,
+            location_lat DECIMAL(10,8) NULL,
+            location_lng DECIMAL(11,8) NULL,
+            camera_type ENUM('fixed','ptz','thermal','drone') DEFAULT 'fixed',
+            resolution VARCHAR(20) DEFAULT '1080p',
+            is_active TINYINT(1) DEFAULT 1,
+            is_recording TINYINT(1) DEFAULT 0,
+            last_seen DATETIME NULL,
+            created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+        ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
+    ");
+} catch (PDOException $e) { /* ignore */ }
+
+// ============================================================
+// HANDLE ACTIONS
+// ============================================================
+$message = ''; $messageType = 'success';
+
+if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['action'])) {
+    $action = $_POST['action'];
+
+    // CREATE
+    if ($action === 'create') {
+        $name     = trim((string)($_POST['camera_name'] ?? ''));
+        $code     = trim((string)($_POST['camera_code'] ?? ''));
+        $stream   = trim((string)($_POST['stream_url'] ?? ''));
+        $latRaw   = (string)($_POST['location_lat'] ?? '');
+        $lngRaw   = (string)($_POST['location_lng'] ?? '');
+        $lat      = $latRaw !== '' ? (float)$latRaw : null;
+        $lng      = $lngRaw !== '' ? (float)$lngRaw : null;
+        $type     = (string)($_POST['camera_type'] ?? 'fixed');
+        $res      = trim((string)($_POST['resolution'] ?? '1080p'));
+
+        if ($name === '') {
+            $message = 'Camera name is required.'; $messageType = 'danger';
+        } elseif (!in_array($type, ['fixed','ptz','thermal','drone'], true)) {
+            $message = 'Invalid camera type.'; $messageType = 'danger';
+        } else {
+            $check = ws_cam_validate_url($stream);
+            if (!$check['ok']) {
+                $message = 'Invalid stream URL: ' . htmlspecialchars($check['error']); $messageType = 'danger';
+            } else {
+                try {
+                    $pdo->prepare("
+                        INSERT INTO cctv_cameras
+                            (zone_id, camera_name, camera_code, stream_url,
+                             location_lat, location_lng, camera_type, resolution,
+                             is_active, is_recording, created_at)
+                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, 1, 0, NOW())
+                    ")->execute([
+                        $activeZoneId, $name, $code ?: null, $stream ?: null,
+                        $lat, $lng, $type, $res,
+                    ]);
+                    logAudit($user['id'], 'create_camera', ['camera_name' => $name, 'zone_id' => $activeZoneId]);
+                    $message = "✅ Camera '{$name}' added.";
+                } catch (PDOException $e) {
+                    error_log('[WS-SUP-CAM] create: ' . $e->getMessage());
+                    $message = 'Could not add camera. Please try again.'; $messageType = 'danger';
+                }
+            }
+        }
+    }
+
+    // UPDATE
+    if ($action === 'update') {
+        $id       = (int)($_POST['camera_id'] ?? 0);
+        $name     = trim((string)($_POST['camera_name'] ?? ''));
+        $code     = trim((string)($_POST['camera_code'] ?? ''));
+        $stream   = trim((string)($_POST['stream_url'] ?? ''));
+        $latRaw   = (string)($_POST['location_lat'] ?? '');
+        $lngRaw   = (string)($_POST['location_lng'] ?? '');
+        $lat      = $latRaw !== '' ? (float)$latRaw : null;
+        $lng      = $lngRaw !== '' ? (float)$lngRaw : null;
+        $type     = (string)($_POST['camera_type'] ?? 'fixed');
+        $res      = trim((string)($_POST['resolution'] ?? '1080p'));
+
+        if ($id <= 0 || $name === '') {
+            $message = 'Camera name is required.'; $messageType = 'danger';
+        } elseif (!in_array($type, ['fixed','ptz','thermal','drone'], true)) {
+            $message = 'Invalid camera type.'; $messageType = 'danger';
+        } else {
+            $check = ws_cam_validate_url($stream);
+            if (!$check['ok']) {
+                $message = 'Invalid stream URL: ' . htmlspecialchars($check['error']); $messageType = 'danger';
+            } else {
+                try {
+                    $stmt = $pdo->prepare("
+                        UPDATE cctv_cameras SET
+                            camera_name = ?, camera_code = ?, stream_url = ?,
+                            location_lat = ?, location_lng = ?, camera_type = ?, resolution = ?
+                        WHERE id = ? AND zone_id = ?
+                    ");
+                    $stmt->execute([$name, $code ?: null, $stream ?: null, $lat, $lng, $type, $res, $id, $activeZoneId]);
+                    if ($stmt->rowCount() === 0) {
+                        $message = 'Camera not found in your zone or no changes made.'; $messageType = 'warning';
+                    } else {
+                        logAudit($user['id'], 'update_camera', ['camera_id' => $id, 'zone_id' => $activeZoneId]);
+                        $message = "✅ Camera '{$name}' updated.";
+                    }
+                } catch (PDOException $e) {
+                    error_log('[WS-SUP-CAM] update: ' . $e->getMessage());
+                    $message = 'Could not update camera.'; $messageType = 'danger';
+                }
+            }
+        }
+    }
+
+    // TOGGLE ACTIVE
+    if ($action === 'toggle') {
+        $id = (int)($_POST['camera_id'] ?? 0);
+        try {
+            $row = $pdo->prepare("SELECT camera_name, is_active, is_recording FROM cctv_cameras WHERE id = ? AND zone_id = ? LIMIT 1");
+            $row->execute([$id, $activeZoneId]);
+            $c = $row->fetch();
+            if (!$c) { $message = 'Camera not found.'; $messageType = 'danger'; }
+            else {
+                $wasActive = (int)$c['is_active'] === 1;
+                $pdo->prepare("UPDATE cctv_cameras SET is_active = NOT is_active WHERE id = ? AND zone_id = ?")
+                    ->execute([$id, $activeZoneId]);
+
+                $extra = '';
+                if ($wasActive && (int)$c['is_recording'] === 1) {
+                    $pdo->prepare("UPDATE cctv_cameras SET is_recording = 0 WHERE id = ?")->execute([$id]);
+                    $extra = ' (recording stopped)';
+                }
+                logAudit($user['id'], 'toggle_camera', ['camera_id' => $id, 'new_state' => $wasActive ? 'inactive' : 'active']);
+                $message = "✅ Camera '{$c['camera_name']}' " . ($wasActive ? 'deactivated' : 'activated') . $extra . ".";
+            }
+        } catch (PDOException $e) {
+            error_log('[WS-SUP-CAM] toggle: ' . $e->getMessage());
+            $message = 'Could not toggle camera.'; $messageType = 'danger';
+        }
+    }
+
+    // TOGGLE RECORDING (guard: camera must be active)
+    if ($action === 'toggle_rec') {
+        $id = (int)($_POST['camera_id'] ?? 0);
+        try {
+            $row = $pdo->prepare("SELECT camera_name, is_active, is_recording FROM cctv_cameras WHERE id = ? AND zone_id = ? LIMIT 1");
+            $row->execute([$id, $activeZoneId]);
+            $c = $row->fetch();
+            if (!$c) { $message = 'Camera not found.'; $messageType = 'danger'; }
+            elseif ((int)$c['is_active'] !== 1) {
+                $message = "❌ Camera '{$c['camera_name']}' is inactive. Activate it first."; $messageType = 'danger';
+            } else {
+                $pdo->prepare("UPDATE cctv_cameras SET is_recording = NOT is_recording WHERE id = ? AND zone_id = ?")
+                    ->execute([$id, $activeZoneId]);
+                $newState = (int)$c['is_recording'] === 1 ? 'stopped' : 'started';
+                logAudit($user['id'], 'toggle_camera_recording', ['camera_id' => $id, 'new_state' => $newState]);
+                $message = "✅ Recording {$newState} on '{$c['camera_name']}'.";
+            }
+        } catch (PDOException $e) {
+            error_log('[WS-SUP-CAM] toggle_rec: ' . $e->getMessage());
+            $message = 'Could not toggle recording.'; $messageType = 'danger';
+        }
+    }
+
+    // DELETE (guard: no detections today)
+    if ($action === 'delete') {
+        $id = (int)($_POST['camera_id'] ?? 0);
+        try {
+            $row = $pdo->prepare("SELECT camera_name, is_recording FROM cctv_cameras WHERE id = ? AND zone_id = ? LIMIT 1");
+            $row->execute([$id, $activeZoneId]);
+            $c = $row->fetch();
+            if (!$c) { $message = 'Camera not found.'; $messageType = 'danger'; }
+            elseif ((int)$c['is_recording'] === 1) {
+                $message = "❌ Cannot delete '{$c['camera_name']}' — stop recording first."; $messageType = 'danger';
+            } else {
+                $detCount = safeCount($pdo, "SELECT COUNT(*) as count FROM ai_detections WHERE camera_id = ?", [$id]);
+                $pdo->prepare("DELETE FROM cctv_cameras WHERE id = ? AND zone_id = ?")->execute([$id, $activeZoneId]);
+                logAudit($user['id'], 'delete_camera', ['camera_id' => $id, 'name' => $c['camera_name'], 'detections_left' => $detCount]);
+                $message = "🗑️ Camera '{$c['camera_name']}' deleted.";
+                if ($detCount > 0) $message .= " ({$detCount} historical detection(s) preserved.)";
+            }
+        } catch (PDOException $e) {
+            error_log('[WS-SUP-CAM] delete: ' . $e->getMessage());
+            $message = 'Could not delete camera.'; $messageType = 'danger';
+        }
+    }
+}
+
+// ============================================================
+// FETCH
+// ============================================================
+$filterStatus = in_array($_GET['status'] ?? '', ['active','inactive','recording'], true) ? (string)$_GET['status'] : '';
+$filterType   = in_array($_GET['type'] ?? '', ['fixed','ptz','thermal','drone'], true)   ? (string)$_GET['type']   : '';
+$search       = trim((string)($_GET['search'] ?? ''));
+
+$where  = " WHERE c.zone_id = ? ";
+$params = [$activeZoneId];
+
+if ($filterStatus === 'active')    $where .= " AND c.is_active = 1 ";
+if ($filterStatus === 'inactive')  $where .= " AND c.is_active = 0 ";
+if ($filterStatus === 'recording') $where .= " AND c.is_recording = 1 ";
+if ($filterType !== '') { $where .= " AND c.camera_type = ? "; $params[] = $filterType; }
+if ($search !== '') {
+    $where .= " AND (c.camera_name LIKE ? OR c.camera_code LIKE ?) ";
+    $like = '%' . $search . '%';
+    $params[] = $like; $params[] = $like;
+}
+
+$cameras = safeFetchAll($pdo, "
+    SELECT c.*, z.name AS zone_name,
+           (SELECT COUNT(*) FROM ai_detections d
+             WHERE d.camera_id = c.id AND DATE(d.detected_at) = CURDATE()) AS detections_today
+    FROM cctv_cameras c
+    LEFT JOIN zones z ON c.zone_id = z.id
+    $where
+    ORDER BY c.is_active DESC, c.camera_name
+    LIMIT " . (int)$globalItemsPerPage . "
+", $params);
+
+$stats = [
+    'total'     => safeCount($pdo, "SELECT COUNT(*) as count FROM cctv_cameras WHERE zone_id = ?", [$activeZoneId]),
+    'active'    => safeCount($pdo, "SELECT COUNT(*) as count FROM cctv_cameras WHERE zone_id = ? AND is_active = 1", [$activeZoneId]),
+    'inactive'  => safeCount($pdo, "SELECT COUNT(*) as count FROM cctv_cameras WHERE zone_id = ? AND is_active = 0", [$activeZoneId]),
+    'recording' => safeCount($pdo, "SELECT COUNT(*) as count FROM cctv_cameras WHERE zone_id = ? AND is_recording = 1", [$activeZoneId]),
+    'ptz'       => safeCount($pdo, "SELECT COUNT(*) as count FROM cctv_cameras WHERE zone_id = ? AND camera_type = 'ptz'", [$activeZoneId]),
+    'thermal'   => safeCount($pdo, "SELECT COUNT(*) as count FROM cctv_cameras WHERE zone_id = ? AND camera_type = 'thermal'", [$activeZoneId]),
+];
+
+$typeIcons = ['fixed' => '📹', 'ptz' => '🎥', 'thermal' => '🌡️', 'drone' => '🚁'];
+$zoneName  = function_exists('getZoneName') ? (getZoneName($activeZoneId) ?: 'Your Zone') : 'Your Zone';
+?>
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+    <title>CCTV Cameras - Supervisor - Wildlife Sentinel</title>
+    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css">
+    <link rel="stylesheet" href="../assets/css/style.css">
+    <link rel="stylesheet" href="../assets/css/transitions.css">
+    <style>
+        .dashboard-greeting { margin-bottom: 24px; }
+        .dashboard-greeting h1 { font-size: 28px; color: #0d3b22; }
+        .dashboard-greeting p  { color: #6c757d; font-size: 16px; }
+
+        .quick-nav { display: flex; gap: 8px; flex-wrap: wrap; margin-bottom: 16px; }
+        .quick-nav .btn { font-size: 12px; padding: 6px 12px; }
+
+        .state-banner { display: flex; align-items: center; gap: 10px; padding: 10px 14px; border-radius: 10px; margin-bottom: 14px; font-size: 12.5px; }
+        .state-banner.warn { background: #fff3cd; border: 1px solid #ffc107; color: #856404; }
+        .state-banner a { color: inherit; text-decoration: underline; }
+
+        .settings-echo {
+            background: #eef7f1; border: 1px solid #c3e6cb;
+            border-radius: 10px; padding: 12px 16px;
+            margin-bottom: 16px; font-size: 12.5px;
+            color: #155724;
+        }
+        .settings-echo strong { color: #0d3b22; }
+        .settings-echo code { font-size: 11.5px; background: rgba(255,255,255,.6); padding: 1px 6px; border-radius: 4px; }
+
+        .stats-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); gap: 14px; margin-bottom: 24px; }
+        .stat-card { background: white; border-radius: 12px; padding: 16px 18px; box-shadow: 0 2px 8px rgba(0,0,0,0.06); display: flex; align-items: center; gap: 12px; border: 1px solid #f0f0f0; transition: all 0.3s; }
+        .stat-card:hover { transform: translateY(-3px); box-shadow: 0 8px 25px rgba(0,0,0,0.1); }
+        .stat-card .icon { width: 44px; height: 44px; border-radius: 10px; display: flex; align-items: center; justify-content: center; font-size: 20px; flex-shrink: 0; }
+        .stat-card .icon.blue { background: #cce5ff; color: #004085; }
+        .stat-card .icon.green { background: #d4edda; color: #155724; }
+        .stat-card .icon.red { background: #f8d7da; color: #721c24; }
+        .stat-card .icon.orange { background: #fff3cd; color: #856404; }
+        .stat-card .icon.purple { background: #e8d5f5; color: #6f42c1; }
+        .stat-card .icon.teal { background: #d1ecf1; color: #0c5460; }
+        .stat-card .info .number { font-size: 22px; font-weight: 700; color: #0d3b22; }
+        .stat-card .info .label  { font-size: 11px; color: #6c757d; }
+
+        .section { background: white; border-radius: 14px; padding: 20px 22px; margin-bottom: 20px; box-shadow: 0 2px 12px rgba(0,0,0,0.06); border: 1px solid #f0f0f0; }
+        .section-header { display: flex; justify-content: space-between; align-items: center; margin-bottom: 14px; flex-wrap: wrap; gap: 10px; }
+        .section-header h2 { font-size: 17px; color: #0d3b22; display: flex; align-items: center; gap: 10px; }
+
+        .btn { padding: 9px 18px; border-radius: 8px; border: none; cursor: pointer; font-size: 13px; font-weight: 600; transition: all 0.2s; text-decoration: none; display: inline-flex; align-items: center; gap: 6px; }
+        .btn-primary { background: #1a5c3a; color: white; }
+        .btn-primary:hover { background: #0d3b22; }
+        .btn-secondary { background: #f0f0f0; color: #495057; }
+        .btn-danger { background: #dc3545; color: white; }
+        .btn-success { background: #28a745; color: white; }
+        .btn-warning { background: #ffc107; color: #212529; }
+        .btn-sm { padding: 6px 12px; font-size: 12px; }
+        .btn:disabled { opacity: .5; cursor: not-allowed; }
+
+        .alert { padding: 12px 16px; border-radius: 10px; margin-bottom: 16px; font-size: 14px; }
+        .alert.success { background: #d4edda; color: #155724; }
+        .alert.danger  { background: #f8d7da; color: #721c24; }
+        .alert.warning { background: #fff3cd; color: #856404; }
+
+        .filter-bar { display: grid; grid-template-columns: repeat(auto-fit, minmax(160px, 1fr)); gap: 12px; align-items: end; }
+        .filter-group { display: flex; flex-direction: column; gap: 4px; }
+        .filter-group label { font-size: 11px; color: #6c757d; text-transform: uppercase; letter-spacing: 0.5px; font-weight: 600; }
+        .filter-group input, .filter-group select { padding: 9px 12px; border: 1px solid #e0e0e0; border-radius: 8px; font-size: 13px; background: #fafafa; }
+        .filter-group input:focus, .filter-group select:focus { outline: none; border-color: #1a5c3a; background: white; }
+
+        .cam-table { width: 100%; border-collapse: collapse; }
+        .cam-table thead th { text-align: left; font-size: 11px; color: #6c757d; text-transform: uppercase; letter-spacing: 0.5px; padding: 10px 12px; border-bottom: 2px solid #f0f0f0; background: #fafafa; font-weight: 700; }
+        .cam-table tbody tr { border-bottom: 1px solid #f5f5f5; }
+        .cam-table tbody tr:hover { background: #fafafa; }
+        .cam-table td { padding: 12px; font-size: 13px; vertical-align: middle; }
+
+        .cam-icon { width: 38px; height: 38px; border-radius: 8px; display: inline-flex; align-items: center; justify-content: center; font-size: 18px; background: #f0f7f4; flex-shrink: 0; }
+
+        .status-pill { padding: 3px 10px; border-radius: 12px; font-size: 10px; font-weight: 700; text-transform: uppercase; display: inline-block; }
+        .status-pill.active { background: #d4edda; color: #155724; }
+        .status-pill.inactive { background: #e9ecef; color: #495057; }
+        .status-pill.recording { background: #f8d7da; color: #721c24; }
+
+        .empty-state { text-align:center; padding:40px 20px; color:#6c757d; }
+        .empty-state .icon { font-size: 48px; display: block; margin-bottom: 10px; opacity: 0.4; }
+
+        .modal-backdrop { position: fixed; inset: 0; background: rgba(0,0,0,0.5); z-index: 2000; display: none; align-items: center; justify-content: center; padding: 20px; }
+        .modal-backdrop.show { display: flex; }
+        .modal { background: white; border-radius: 14px; max-width: 560px; width: 100%; max-height: 90vh; overflow-y: auto; box-shadow: 0 20px 60px rgba(0,0,0,0.3); }
+        .modal-header { padding: 18px 22px; border-bottom: 1px solid #f0f0f0; display: flex; justify-content: space-between; align-items: center; }
+        .modal-header h3 { font-size: 18px; color: #0d3b22; }
+        .modal-close { background: none; border: none; font-size: 24px; cursor: pointer; color: #6c757d; }
+        .modal-body { padding: 22px; }
+        .modal-footer { padding: 16px 22px; border-top: 1px solid #f0f0f0; display: flex; justify-content: flex-end; gap: 10px; }
+
+        .form-row { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; }
+        .form-group { margin-bottom: 14px; }
+        .form-group label { display: block; font-size: 12px; color: #495057; font-weight: 600; margin-bottom: 6px; }
+        .form-group input, .form-group select { width: 100%; padding: 10px 14px; border: 1px solid #e0e0e0; border-radius: 8px; font-size: 13px; background: #fafafa; font-family: inherit; }
+        .form-group input:focus, .form-group select:focus { outline: none; border-color: #1a5c3a; background: white; }
+        .field-hint { font-size: 11.5px; color: #6c757d; margin-top: 4px; display: block; }
+        .field-hint.ok  { color: #28a745; }
+        .field-hint.err { color: #dc3545; }
+
+        @media (max-width: 1024px) {
+            .cam-table thead { display: none; }
+            .cam-table, .cam-table tbody, .cam-table tr, .cam-table td { display: block; width: 100%; }
+            .cam-table tr { margin-bottom: 12px; padding: 12px; border-radius: 10px; background: #fafafa; border: 1px solid #f0f0f0; }
+            .cam-table td { padding: 4px 0; border: none; }
+            .cam-table td::before { content: attr(data-label); font-size: 10px; text-transform: uppercase; color: #adb5bd; display: block; margin-bottom: 2px; }
+        }
+        @media (max-width: 768px) {
+            .stats-grid { grid-template-columns: 1fr 1fr; gap: 10px; }
+            .dashboard-greeting h1 { font-size: 22px; }
+            .form-row { grid-template-columns: 1fr; }
+        }
+    </style>
+</head>
+<body>
+    <div class="app-container">
+        <?php include '../includes/sidebar.php'; ?>
+
+        <main class="main-content">
+            <header class="top-header">
+                <button class="menu-toggle" onclick="toggleSidebar()">☰</button>
+                <h1>CCTV Cameras</h1>
+                <div class="header-right">
+                    <span class="online-status">● Online</span>
+                    <span class="data-honesty-badge">🟢 Live Data</span>
+                    <span class="user-name"><?= htmlspecialchars($user['full_name']) ?></span>
+                </div>
+            </header>
+
+            <div class="content">
+                <div class="dashboard-greeting">
+                    <h1>📹 CCTV Cameras</h1>
+                    <p>Manage cameras for <strong><?= htmlspecialchars($zoneName) ?></strong>.</p>
+                </div>
+
+                <div class="quick-nav">
+                    <a href="dashboard.php" class="btn btn-secondary">🏠 Dashboard</a>
+                    <a href="ai-dashboard.php" class="btn btn-secondary">🤖 AI Dashboard</a>
+                    <a href="alarm-systems.php" class="btn btn-secondary">🔔 Alarms</a>
+                    <a href="zone-settings.php" class="btn btn-secondary">⚙️ Zone Settings</a>
+                </div>
+
+                <?php if (!$globalAiEnabled): ?>
+                    <div class="state-banner warn">
+                        <span>⛔</span>
+                        <div>
+                            <strong>AI Detection is globally disabled.</strong>
+                            Cameras can still be managed, but no detections or alerts will be generated
+                            until an administrator re-enables the pipeline.
+                        </div>
+                    </div>
+                <?php endif; ?>
+
+                <div class="settings-echo">
+                    <strong>🧾 Camera pipeline governed by System Settings:</strong>
+                    Retention <strong><?= (int)$globalCctvRetention ?> days</strong>
+                    • Snapshot dir <code><?= htmlspecialchars($globalCctvSnapshotDir) ?></code>
+                </div>
+
+                <?php if ($message): ?>
+                    <div class="alert <?= htmlspecialchars($messageType) ?>"><?= $message ?></div>
+                <?php endif; ?>
+
+                <div class="stats-grid">
+                    <div class="stat-card"><div class="icon blue">📹</div><div class="info"><div class="number"><?= (int)$stats['total'] ?></div><div class="label">Total Cameras</div></div></div>
+                    <div class="stat-card"><div class="icon green">✅</div><div class="info"><div class="number"><?= (int)$stats['active'] ?></div><div class="label">Active</div></div></div>
+                    <div class="stat-card"><div class="icon orange">⚪</div><div class="info"><div class="number"><?= (int)$stats['inactive'] ?></div><div class="label">Inactive</div></div></div>
+                    <div class="stat-card"><div class="icon red">⏺️</div><div class="info"><div class="number"><?= (int)$stats['recording'] ?></div><div class="label">Recording</div></div></div>
+                    <div class="stat-card"><div class="icon purple">🎥</div><div class="info"><div class="number"><?= (int)$stats['ptz'] ?></div><div class="label">PTZ</div></div></div>
+                    <div class="stat-card"><div class="icon teal">🌡️</div><div class="info"><div class="number"><?= (int)$stats['thermal'] ?></div><div class="label">Thermal</div></div></div>
+                </div>
+
+                <div class="section">
+                    <div class="section-header">
+                        <h2>🔎 Filter Cameras</h2>
+                        <?php if ($filterStatus || $filterType || $search): ?>
+                            <a href="cctv-cameras.php" class="btn btn-secondary btn-sm">✕ Clear</a>
+                        <?php endif; ?>
+                    </div>
+                    <form method="GET" class="filter-bar">
+                        <div class="filter-group">
+                            <label>Status</label>
+                            <select name="status">
+                                <option value="">All</option>
+                                <option value="active"    <?= $filterStatus === 'active'    ? 'selected' : '' ?>>Active</option>
+                                <option value="inactive"  <?= $filterStatus === 'inactive'  ? 'selected' : '' ?>>Inactive</option>
+                                <option value="recording" <?= $filterStatus === 'recording' ? 'selected' : '' ?>>Recording</option>
+                            </select>
+                        </div>
+                        <div class="filter-group">
+                            <label>Type</label>
+                            <select name="type">
+                                <option value="">All Types</option>
+                                <option value="fixed"   <?= $filterType === 'fixed'   ? 'selected' : '' ?>>Fixed</option>
+                                <option value="ptz"     <?= $filterType === 'ptz'     ? 'selected' : '' ?>>PTZ</option>
+                                <option value="thermal" <?= $filterType === 'thermal' ? 'selected' : '' ?>>Thermal</option>
+                                <option value="drone"   <?= $filterType === 'drone'   ? 'selected' : '' ?>>Drone</option>
+                            </select>
+                        </div>
+                        <div class="filter-group">
+                            <label>Search</label>
+                            <input type="text" name="search" value="<?= htmlspecialchars($search) ?>" placeholder="Name or code">
+                        </div>
+                        <div class="filter-group">
+                            <label>&nbsp;</label>
+                            <button type="submit" class="btn btn-primary">🔎 Apply</button>
+                        </div>
+                    </form>
+                </div>
+
+                <div class="section">
+                    <div class="section-header">
+                        <h2>📋 Cameras (<?= count($cameras) ?>)</h2>
+                        <button class="btn btn-primary" onclick="openCreateModal()">
+                            <i class="fas fa-plus"></i> Add Camera
+                        </button>
+                    </div>
+
+                    <?php if (count($cameras) > 0): ?>
+                        <table class="cam-table">
+                            <thead>
+                                <tr>
+                                    <th style="width:50px;"></th>
+                                    <th>Camera</th>
+                                    <th>Type</th>
+                                    <th>Status</th>
+                                    <th>Today</th>
+                                    <th>Location</th>
+                                    <th>Actions</th>
+                                </tr>
+                            </thead>
+                            <tbody>
+                                <?php foreach ($cameras as $cam): ?>
+                                    <?php $icon = $typeIcons[$cam['camera_type']] ?? '📹'; ?>
+                                    <tr>
+                                        <td data-label=""><span class="cam-icon"><?= $icon ?></span></td>
+                                        <td data-label="Camera">
+                                            <div style="font-weight:600;color:#0d3b22;font-size:13px;"><?= htmlspecialchars($cam['camera_name']) ?></div>
+                                            <?php if ($cam['camera_code']): ?>
+                                                <div style="font-size:11px;color:#6c757d;">Code: <?= htmlspecialchars($cam['camera_code']) ?></div>
+                                            <?php endif; ?>
+                                        </td>
+                                        <td data-label="Type">
+                                            <span style="font-size:11px;text-transform:uppercase;"><?= htmlspecialchars($cam['camera_type']) ?></span>
+                                        </td>
+                                        <td data-label="Status">
+                                            <?php if (!$cam['is_active']): ?>
+                                                <span class="status-pill inactive">⚪ Inactive</span>
+                                            <?php elseif ($cam['is_recording']): ?>
+                                                <span class="status-pill recording">⏺️ Recording</span>
+                                            <?php else: ?>
+                                                <span class="status-pill active">✅ Active</span>
+                                            <?php endif; ?>
+                                        </td>
+                                        <td data-label="Today">
+                                            <?php if ((int)$cam['detections_today'] > 0): ?>
+                                                <a href="ai-dashboard.php?camera=<?= (int)$cam['id'] ?>&win=24h"
+                                                   class="btn btn-sm btn-secondary" style="font-size:11px;padding:3px 8px;"
+                                                   title="View today's detections">🤖 <?= (int)$cam['detections_today'] ?></a>
+                                            <?php else: ?>
+                                                <span style="font-size:11px;color:#adb5bd;">0</span>
+                                            <?php endif; ?>
+                                        </td>
+                                        <td data-label="Location">
+                                            <?php if ($cam['location_lat'] && $cam['location_lng']): ?>
+                                                <div style="font-size:11px;">📍 <?= number_format((float)$cam['location_lat'], 4) ?>, <?= number_format((float)$cam['location_lng'], 4) ?></div>
+                                            <?php else: ?>
+                                                <span style="font-size:11px;color:#adb5bd;">—</span>
+                                            <?php endif; ?>
+                                        </td>
+                                        <td data-label="Actions">
+                                            <div style="display:flex;gap:6px;flex-wrap:wrap;">
+                                                <button class="btn btn-sm btn-secondary"
+                                                        onclick='openEditModal(<?= htmlspecialchars(json_encode($cam, JSON_HEX_APOS | JSON_HEX_QUOT | JSON_HEX_TAG | JSON_HEX_AMP), ENT_QUOTES) ?>)'>✏️ Edit</button>
+                                                <form method="POST" style="display:inline;">
+                                                    <input type="hidden" name="action" value="toggle">
+                                                    <input type="hidden" name="camera_id" value="<?= (int)$cam['id'] ?>">
+                                                    <button class="btn btn-sm <?= $cam['is_active'] ? 'btn-warning' : 'btn-success' ?>">
+                                                        <?= $cam['is_active'] ? 'Deactivate' : 'Activate' ?>
+                                                    </button>
+                                                </form>
+                                                <form method="POST" style="display:inline;">
+                                                    <input type="hidden" name="action" value="toggle_rec">
+                                                    <input type="hidden" name="camera_id" value="<?= (int)$cam['id'] ?>">
+                                                    <button class="btn btn-sm <?= $cam['is_recording'] ? 'btn-warning' : 'btn-primary' ?>"
+                                                            <?= !$cam['is_active'] ? 'disabled title="Activate first"' : '' ?>>
+                                                        <?= $cam['is_recording'] ? '⏹️ Stop' : '⏺️ Record' ?>
+                                                    </button>
+                                                </form>
+                                                <button class="btn btn-sm btn-danger"
+                                                        <?= $cam['is_recording'] ? 'disabled title="Stop recording first"' : '' ?>
+                                                        onclick="confirmDelete(<?= (int)$cam['id'] ?>, '<?= htmlspecialchars($cam['camera_name'], ENT_QUOTES) ?>')">🗑️</button>
+                                            </div>
+                                        </td>
+                                    </tr>
+                                <?php endforeach; ?>
+                            </tbody>
+                        </table>
+                    <?php else: ?>
+                        <div class="empty-state">
+                            <span class="icon">📹</span>
+                            <h3 style="font-size:15px;color:#495057;">No cameras yet</h3>
+                            <p>Click "Add Camera" to register your first CCTV camera for this zone.</p>
+                        </div>
+                    <?php endif; ?>
+                </div>
+            </div>
+        </main>
+    </div>
+
+    <!-- MODAL -->
+    <div class="modal-backdrop" id="cameraModal">
+        <div class="modal">
+            <form method="POST" id="cameraForm">
+                <input type="hidden" name="action" id="formAction" value="create">
+                <input type="hidden" name="camera_id" id="formCameraId" value="">
+                <div class="modal-header">
+                    <h3 id="modalTitle">➕ Add Camera</h3>
+                    <button type="button" class="modal-close" onclick="closeModal()">×</button>
+                </div>
+                <div class="modal-body">
+                    <div class="form-row">
+                        <div class="form-group">
+                            <label>Camera Type *</label>
+                            <select name="camera_type" id="formCameraType" required>
+                                <option value="fixed">Fixed</option>
+                                <option value="ptz">PTZ</option>
+                                <option value="thermal">Thermal</option>
+                                <option value="drone">Drone</option>
+                            </select>
+                        </div>
+                        <div class="form-group">
+                            <label>Resolution</label>
+                            <input type="text" name="resolution" id="formResolution" value="1080p">
+                        </div>
+                    </div>
+                    <div class="form-group">
+                        <label>Camera Name *</label>
+                        <input type="text" name="camera_name" id="formCameraName" required placeholder="e.g. North Gate Camera 1">
+                    </div>
+                    <div class="form-group">
+                        <label>Camera Code</label>
+                        <input type="text" name="camera_code" id="formCameraCode" placeholder="e.g. SLNP-NG-001">
+                    </div>
+                    <div class="form-group">
+                        <label>Stream URL</label>
+                        <input type="text" name="stream_url" id="formStreamUrl" placeholder="rtsp:// or https://" oninput="validateStreamUrl()">
+                        <span class="field-hint" id="streamUrlHint">Supports rtsp://, rtsps://, http://, https://</span>
+                    </div>
+                    <div class="form-row">
+                        <div class="form-group">
+                            <label>Latitude</label>
+                            <input type="number" step="0.000001" name="location_lat" id="formLat" placeholder="-13.000000">
+                        </div>
+                        <div class="form-group">
+                            <label>Longitude</label>
+                            <input type="number" step="0.000001" name="location_lng" id="formLng" placeholder="31.500000">
+                        </div>
+                    </div>
+                </div>
+                <div class="modal-footer">
+                    <button type="button" class="btn btn-secondary" onclick="closeModal()">Cancel</button>
+                    <button type="submit" class="btn btn-primary" id="modalSubmitBtn">Save Camera</button>
+                </div>
+            </form>
+        </div>
+    </div>
+
+    <form method="POST" id="deleteForm" style="display:none;">
+        <input type="hidden" name="action" value="delete">
+        <input type="hidden" name="camera_id" id="deleteCameraId">
+    </form>
+
+    <script src="../assets/js/app.js"></script>
+    <script src="../assets/js/transitions.js"></script>
+    <script>
+        function openCreateModal() {
+            document.getElementById('modalTitle').textContent = '➕ Add Camera';
+            document.getElementById('formAction').value = 'create';
+            document.getElementById('formCameraId').value = '';
+            document.getElementById('cameraForm').reset();
+            document.getElementById('formCameraType').value = 'fixed';
+            document.getElementById('formResolution').value = '1080p';
+            document.getElementById('modalSubmitBtn').textContent = 'Add Camera';
+            validateStreamUrl();
+            document.getElementById('cameraModal').classList.add('show');
+        }
+        function openEditModal(cam) {
+            document.getElementById('modalTitle').textContent = '✏️ Edit Camera';
+            document.getElementById('formAction').value = 'update';
+            document.getElementById('formCameraId').value = cam.id;
+            document.getElementById('formCameraType').value = cam.camera_type || 'fixed';
+            document.getElementById('formCameraName').value = cam.camera_name || '';
+            document.getElementById('formCameraCode').value = cam.camera_code || '';
+            document.getElementById('formResolution').value = cam.resolution || '1080p';
+            document.getElementById('formStreamUrl').value = cam.stream_url || '';
+            document.getElementById('formLat').value = cam.location_lat || '';
+            document.getElementById('formLng').value = cam.location_lng || '';
+            document.getElementById('modalSubmitBtn').textContent = 'Save Changes';
+            validateStreamUrl();
+            document.getElementById('cameraModal').classList.add('show');
+        }
+        function closeModal() { document.getElementById('cameraModal').classList.remove('show'); }
+        function confirmDelete(id, name) {
+            if (confirm('Delete camera "' + name + '"?\n\nHistorical detections and alerts will be preserved.')) {
+                document.getElementById('deleteCameraId').value = id;
+                document.getElementById('deleteForm').submit();
+            }
+        }
+        function validateStreamUrl() {
+            const el = document.getElementById('formStreamUrl');
+            const hint = document.getElementById('streamUrlHint');
+            const v = (el.value || '').trim();
+            if (!v) { hint.textContent = 'Supports rtsp://, rtsps://, http://, https://'; hint.className = 'field-hint'; return; }
+            try {
+                const url = new URL(v);
+                const scheme = url.protocol.replace(':', '').toLowerCase();
+                if (!['rtsp','rtsps','http','https'].includes(scheme)) {
+                    hint.textContent = '⚠️ Unsupported scheme: ' + scheme;
+                    hint.className = 'field-hint err';
+                } else {
+                    hint.textContent = '✅ Valid ' + scheme.toUpperCase() + ' stream';
+                    hint.className = 'field-hint ok';
+                }
+            } catch (e) {
+                hint.textContent = '⚠️ Invalid URL — missing scheme or malformed';
+                hint.className = 'field-hint err';
+            }
+        }
+        document.getElementById('cameraModal').addEventListener('click', function(e) { if (e.target === this) closeModal(); });
+        document.addEventListener('keydown', function(e) { if (e.key === 'Escape') closeModal(); });
+    </script>
+</body>
+</html>

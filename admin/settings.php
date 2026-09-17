@@ -1,0 +1,752 @@
+<?php
+// ============================================================
+// admin/settings.php
+// Wildlife Sentinel — System Settings (Admin)
+// ============================================================
+// Sections:
+//   - General (site name, timezone, language)
+//   - Notifications (SMS, email, push toggles)
+//   - AI / CCTV defaults
+//   - Security (password policy, session timeout)
+//   - Maintenance mode
+// ============================================================
+
+require_once __DIR__ . '/../includes/functions.php';
+requireAdmin();
+
+// Maintainers keep access — no redirect even when maintenance_mode = 1
+if (function_exists('applySessionTimeout')) {
+    applySessionTimeout();
+}
+
+$user = getCurrentUser();
+$pdo  = getDB();
+
+// ============================================================
+// AUTO-CREATE settings TABLE IF MISSING
+// ============================================================
+try {
+    $pdo->exec("
+        CREATE TABLE IF NOT EXISTS settings (
+            id INT(11) AUTO_INCREMENT PRIMARY KEY,
+            setting_key VARCHAR(100) UNIQUE NOT NULL,
+            setting_value TEXT NULL,
+            setting_group VARCHAR(50) DEFAULT 'general',
+            updated_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+            updated_by INT(11) NULL,
+            INDEX idx_group (setting_group),
+            INDEX idx_key (setting_key)
+        ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
+    ");
+} catch (PDOException $e) {
+    error_log('[WS-SETTINGS] create table: ' . $e->getMessage());
+}
+
+// ============================================================
+// DEFAULT SETTINGS
+// ============================================================
+$defaults = [
+    // General
+    'site_name'             => 'Wildlife Sentinel',
+    'site_tagline'          => 'Protecting Zambia\'s Wildlife',
+    'timezone'              => 'Africa/Lusaka',
+    'language'              => 'en',
+    'date_format'           => 'M j, Y H:i',
+    'items_per_page'        => '25',
+
+    // Notifications
+    'sms_enabled'           => '1',
+    'email_enabled'         => '0',
+    'push_enabled'          => '1',
+    'notify_on_incident'    => '1',
+    'notify_on_ai_alert'    => '1',
+    'notify_on_alarm'       => '1',
+    'notify_on_manpower'    => '1',
+    'notify_offline_users'  => '1',
+
+    // AI / CCTV
+    'ai_enabled'            => '1',
+    'ai_confidence_min'     => '70',
+    'ai_auto_create_alert'  => '1',
+    'ai_auto_trigger_alarm' => '0',
+    'cctv_retention_days'   => '30',
+    'cctv_snapshot_dir'     => 'uploads/cctv/',
+
+    // Security
+    'session_timeout_min'   => '60',
+    'password_min_length'   => '8',
+    'password_require_upper'=> '1',
+    'password_require_lower'=> '1',
+    'password_require_num'  => '1',
+    'password_require_sym'  => '0',
+    'login_max_attempts'    => '5',
+    'login_lockout_min'     => '5',
+
+    // Maintenance
+    'maintenance_mode'      => '0',
+    'maintenance_message'   => 'System under maintenance. Please check back soon.',
+];
+
+// ============================================================
+// LOAD CURRENT SETTINGS (merged with defaults)
+// ============================================================
+$currentSettings = $defaults;
+try {
+    $rows = $pdo->query("SELECT setting_key, setting_value FROM settings")->fetchAll();
+    foreach ($rows as $r) {
+        if (array_key_exists($r['setting_key'], $currentSettings)) {
+            $currentSettings[$r['setting_key']] = $r['setting_value'];
+        }
+    }
+} catch (PDOException $e) {
+    error_log('[WS-SETTINGS] load: ' . $e->getMessage());
+}
+
+// ============================================================
+// DETERMINE WHICH GROUP A KEY BELONGS TO
+// ============================================================
+function ws_setting_group(string $key): string {
+    if (preg_match('/^(sms_|email_|push_|notify_)/', $key))     return 'notifications';
+    if (preg_match('/^(ai_|cctv_)/', $key))                     return 'ai';
+    if (preg_match('/^(session_|password_|login_)/', $key))     return 'security';
+    if (preg_match('/^maintenance_/', $key))                    return 'maintenance';
+    return 'general';
+}
+
+// ============================================================
+// HANDLE SAVE
+// ============================================================
+$message     = '';
+$messageType = 'success';
+$changedKeys = [];
+
+if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['action']) && $_POST['action'] === 'save') {
+    try {
+        $stmt = $pdo->prepare("
+            INSERT INTO settings (setting_key, setting_value, setting_group, updated_at, updated_by)
+            VALUES (?, ?, ?, NOW(), ?)
+            ON DUPLICATE KEY UPDATE
+                setting_value = VALUES(setting_value),
+                setting_group = VALUES(setting_group),
+                updated_at = NOW(),
+                updated_by = VALUES(updated_by)
+        ");
+
+        // All keys we manage
+        $allKeys = array_keys($defaults);
+
+        // Checkbox-style keys (missing from POST = off)
+        $checkboxKeys = [
+            'sms_enabled', 'email_enabled', 'push_enabled',
+            'notify_on_incident', 'notify_on_ai_alert', 'notify_on_alarm',
+            'notify_on_manpower', 'notify_offline_users',
+            'ai_enabled', 'ai_auto_create_alert', 'ai_auto_trigger_alarm',
+            'password_require_upper', 'password_require_lower',
+            'password_require_num', 'password_require_sym',
+            'maintenance_mode',
+        ];
+
+        foreach ($allKeys as $key) {
+            if (in_array($key, $checkboxKeys, true)) {
+                // Present & checked => '1', absent => '0'
+                $val = isset($_POST['settings'][$key]) && $_POST['settings'][$key] === '1' ? '1' : '0';
+            } else {
+                // Regular field — only save if posted
+                if (!array_key_exists($key, $_POST['settings'] ?? [])) continue;
+                $val = (string)$_POST['settings'][$key];
+            }
+
+            $group = ws_setting_group($key);
+
+            // Only mark as "changed" if the value actually differs
+            if (($currentSettings[$key] ?? null) !== $val) {
+                $changedKeys[] = $key;
+            }
+
+            $stmt->execute([$key, $val, $group, $user['id']]);
+        }
+
+        // Refresh the in-session cache so the new values take effect immediately
+        if (function_exists('ws_clear_settings_cache')) {
+            ws_clear_settings_cache();
+        }
+        if (function_exists('ws_load_settings')) {
+            ws_load_settings(true);
+        }
+
+        // Reload into $currentSettings
+        $rows = $pdo->query("SELECT setting_key, setting_value FROM settings")->fetchAll();
+        foreach ($rows as $r) {
+            if (array_key_exists($r['setting_key'], $currentSettings)) {
+                $currentSettings[$r['setting_key']] = $r['setting_value'];
+            }
+        }
+
+        // Group changed keys by section for a nicer message
+        $groups = [];
+        foreach ($changedKeys as $k) { $groups[ws_setting_group($k)][] = $k; }
+
+        logAudit($user['id'], 'update_settings', [
+            'count'   => count($changedKeys),
+            'keys'    => $changedKeys,
+            'groups'  => array_keys($groups),
+        ]);
+
+        if (count($changedKeys) === 0) {
+            $message = 'No changes were made.';
+        } else {
+            $parts = [];
+            foreach ($groups as $g => $keys) {
+                $parts[] = ucfirst($g) . ' (' . count($keys) . ')';
+            }
+            $message = '✅ Settings saved — ' . implode(', ', $parts) . '.';
+        }
+    } catch (PDOException $e) {
+        $message = 'Error saving settings: ' . $e->getMessage();
+        $messageType = 'danger';
+    }
+}
+
+// ============================================================
+// Helpers for templates
+// ============================================================
+function val($key, $current, $fallback = '') {
+    // Prefer the posted value if the form was just submitted with errors
+    if (isset($_POST['settings'][$key])) {
+        return htmlspecialchars((string)$_POST['settings'][$key]);
+    }
+    return htmlspecialchars((string)($current[$key] ?? $fallback));
+}
+function checked($key, $current) {
+    $v = $_POST['settings'][$key] ?? ($current[$key] ?? '0');
+    return $v === '1' ? 'checked' : '';
+}
+?>
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>System Settings - Admin - Wildlife Sentinel</title>
+
+    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css">
+    <link rel="stylesheet" href="../assets/css/style.css">
+    <link rel="stylesheet" href="../assets/css/transitions.css">
+
+    <style>
+        .dashboard-greeting { margin-bottom: 24px; }
+        .dashboard-greeting h1 { font-size: 28px; color: #0d3b22; }
+        .dashboard-greeting p  { color: #6c757d; font-size: 16px; }
+
+        .section { background: white; border-radius: 14px; padding: 20px 22px; margin-bottom: 20px; box-shadow: 0 2px 12px rgba(0,0,0,0.06); border: 1px solid #f0f0f0; }
+        .section-header { display: flex; justify-content: space-between; align-items: center; margin-bottom: 16px; flex-wrap: wrap; gap: 10px; }
+        .section-header h2 { font-size: 17px; color: #0d3b22; display: flex; align-items: center; gap: 10px; }
+        .section-header .section-desc { font-size: 12px; color: #6c757d; margin-top: 2px; }
+
+        .btn { padding: 9px 18px; border-radius: 8px; border: none; cursor: pointer; font-size: 13px; font-weight: 600; transition: all 0.2s; text-decoration: none; display: inline-flex; align-items: center; gap: 6px; }
+        .btn-primary { background: #1a5c3a; color: white; }
+        .btn-primary:hover { background: #0d3b22; }
+        .btn-secondary { background: #f0f0f0; color: #495057; }
+        .btn-danger { background: #dc3545; color: white; }
+        .btn-success { background: #28a745; color: white; }
+
+        .alert { padding: 12px 16px; border-radius: 10px; margin-bottom: 16px; font-size: 14px; }
+        .alert.success { background: #d4edda; color: #155724; }
+        .alert.danger  { background: #f8d7da; color: #721c24; }
+
+        /* Maintenance warning banner */
+        .maint-banner {
+            background: #fff3cd; border: 1px solid #ffc107;
+            color: #856404; border-radius: 10px;
+            padding: 12px 16px; margin-bottom: 20px;
+            display: flex; align-items: center; gap: 10px;
+            font-size: 13.5px;
+        }
+        .maint-banner strong { color: #664d03; }
+
+        .form-grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(240px, 1fr));
+            gap: 16px;
+        }
+
+        .form-group { display: flex; flex-direction: column; gap: 6px; }
+        .form-group label {
+            font-size: 12px; font-weight: 600;
+            color: #495057; text-transform: uppercase;
+            letter-spacing: 0.5px;
+        }
+        .form-group .hint {
+            font-size: 11px; color: #6c757d;
+            font-weight: normal; text-transform: none;
+            letter-spacing: 0;
+        }
+        .form-group input[type="text"],
+        .form-group input[type="number"],
+        .form-group input[type="email"],
+        .form-group input[type="password"],
+        .form-group select,
+        .form-group textarea {
+            padding: 10px 14px; border: 1px solid #e0e0e0;
+            border-radius: 8px; font-size: 13px;
+            background: #fafafa; font-family: inherit;
+            transition: all 0.2s;
+        }
+        .form-group input:focus,
+        .form-group select:focus,
+        .form-group textarea:focus {
+            outline: none; border-color: #1a5c3a; background: white;
+        }
+
+        .toggle-row {
+            display: flex; justify-content: space-between; align-items: center;
+            padding: 12px 0; border-bottom: 1px solid #f0f0f0;
+        }
+        .toggle-row:last-child { border-bottom: none; }
+        .toggle-row .toggle-info { flex: 1; padding-right: 12px; }
+        .toggle-row .toggle-info .toggle-label {
+            font-size: 13px; font-weight: 600; color: #0d3b22;
+        }
+        .toggle-row .toggle-info .toggle-desc {
+            font-size: 11px; color: #6c757d; margin-top: 2px;
+        }
+
+        .switch {
+            position: relative; display: inline-block;
+            width: 46px; height: 26px; flex-shrink: 0;
+        }
+        .switch input { opacity: 0; width: 0; height: 0; }
+        .switch .slider {
+            position: absolute; cursor: pointer;
+            top: 0; left: 0; right: 0; bottom: 0;
+            background-color: #ccc;
+            transition: .3s; border-radius: 26px;
+        }
+        .switch .slider:before {
+            position: absolute; content: "";
+            height: 20px; width: 20px;
+            left: 3px; bottom: 3px;
+            background-color: white;
+            transition: .3s; border-radius: 50%;
+        }
+        .switch input:checked + .slider { background-color: #28a745; }
+        .switch input:checked + .slider:before { transform: translateX(20px); }
+
+        .save-bar {
+            position: sticky; bottom: 0;
+            background: white; padding: 14px 20px;
+            border-radius: 12px;
+            box-shadow: 0 -4px 20px rgba(0,0,0,0.08);
+            display: flex; justify-content: space-between;
+            align-items: center; margin-top: 20px;
+            border: 1px solid #f0f0f0;
+            gap: 12px;
+        }
+        .save-bar .status { font-size: 12px; color: #6c757d; }
+        .save-bar .status.dirty { color: #856404; font-weight: 600; }
+
+        @media (max-width: 768px) {
+            .dashboard-greeting h1 { font-size: 22px; }
+            .save-bar { flex-direction: column; align-items: stretch; }
+            .save-bar .btn { width: 100%; justify-content: center; }
+        }
+    </style>
+</head>
+<body>
+    <div class="app-container">
+        <?php include '../includes/sidebar.php'; ?>
+
+        <main class="main-content">
+            <header class="top-header">
+                <button class="menu-toggle" onclick="toggleSidebar()">☰</button>
+                <h1>System Settings</h1>
+                <div class="header-right">
+                    <span class="online-status">● Online</span>
+                    <span class="data-honesty-badge">🟢 Live Data</span>
+                    <span class="user-name"><?= htmlspecialchars($user['full_name']) ?></span>
+                </div>
+            </header>
+
+            <div class="content">
+                <div class="dashboard-greeting">
+                    <h1>⚙️ System Settings</h1>
+                    <p>Configure global options, notifications, AI thresholds, and security policies.</p>
+                </div>
+
+                <?php if (($currentSettings['maintenance_mode'] ?? '0') === '1'): ?>
+                    <div class="maint-banner">
+                        <i class="fas fa-triangle-exclamation" style="font-size:18px;"></i>
+                        <span><strong>Maintenance mode is ON.</strong> Non-admin users are being redirected to <code>maintenance.php</code>. You can still browse the system normally.</span>
+                    </div>
+                <?php endif; ?>
+
+                <?php if ($message): ?>
+                    <div class="alert <?= $messageType ?>"><?= htmlspecialchars($message) ?></div>
+                <?php endif; ?>
+
+                <form method="POST" id="settingsForm">
+                    <input type="hidden" name="action" value="save">
+
+                    <!-- GENERAL -->
+                    <div class="section">
+                        <div class="section-header">
+                            <div>
+                                <h2>🌍 General</h2>
+                                <div class="section-desc">Basic site information and display options.</div>
+                            </div>
+                        </div>
+                        <div class="form-grid">
+                            <div class="form-group">
+                                <label>Site Name</label>
+                                <input type="text" name="settings[site_name]" value="<?= val('site_name', $currentSettings) ?>">
+                            </div>
+                            <div class="form-group">
+                                <label>Tagline</label>
+                                <input type="text" name="settings[site_tagline]" value="<?= val('site_tagline', $currentSettings) ?>">
+                            </div>
+                            <div class="form-group">
+                                <label>Timezone</label>
+                                <select name="settings[timezone]">
+                                    <?php
+                                    $timezones = ['Africa/Lusaka', 'Africa/Johannesburg', 'Africa/Nairobi', 'UTC', 'Europe/London', 'America/New_York'];
+                                    foreach ($timezones as $tz):
+                                    ?>
+                                        <option value="<?= $tz ?>" <?= ($currentSettings['timezone'] ?? '') === $tz ? 'selected' : '' ?>>
+                                            <?= $tz ?>
+                                        </option>
+                                    <?php endforeach; ?>
+                                </select>
+                            </div>
+                            <div class="form-group">
+                                <label>Language</label>
+                                <select name="settings[language]">
+                                    <option value="en"  <?= ($currentSettings['language'] ?? '') === 'en'  ? 'selected' : '' ?>>English</option>
+                                    <option value="ny"  <?= ($currentSettings['language'] ?? '') === 'ny'  ? 'selected' : '' ?>>Chichewa</option>
+                                    <option value="bem" <?= ($currentSettings['language'] ?? '') === 'bem' ? 'selected' : '' ?>>Bemba</option>
+                                </select>
+                            </div>
+                            <div class="form-group">
+                                <label>Date Format</label>
+                                <input type="text" name="settings[date_format]" value="<?= val('date_format', $currentSettings) ?>" placeholder="M j, Y H:i">
+                                <span class="hint">PHP date format (e.g. M j, Y H:i)</span>
+                            </div>
+                            <div class="form-group">
+                                <label>Items Per Page</label>
+                                <input type="number" name="settings[items_per_page]" value="<?= val('items_per_page', $currentSettings) ?>" min="5" max="100">
+                            </div>
+                        </div>
+                    </div>
+
+                    <!-- NOTIFICATIONS -->
+                    <div class="section">
+                        <div class="section-header">
+                            <div>
+                                <h2>🔔 Notifications</h2>
+                                <div class="section-desc">Control which channels and events trigger notifications.</div>
+                            </div>
+                        </div>
+
+                        <div class="toggle-row">
+                            <div class="toggle-info">
+                                <div class="toggle-label">📱 SMS Notifications</div>
+                                <div class="toggle-desc">Send SMS alerts for critical events.</div>
+                            </div>
+                            <label class="switch">
+                                <input type="checkbox" name="settings[sms_enabled]" value="1" <?= checked('sms_enabled', $currentSettings) ?>>
+                                <span class="slider"></span>
+                            </label>
+                        </div>
+
+                        <div class="toggle-row">
+                            <div class="toggle-info">
+                                <div class="toggle-label">📧 Email Notifications</div>
+                                <div class="toggle-desc">Send email digests and alerts.</div>
+                            </div>
+                            <label class="switch">
+                                <input type="checkbox" name="settings[email_enabled]" value="1" <?= checked('email_enabled', $currentSettings) ?>>
+                                <span class="slider"></span>
+                            </label>
+                        </div>
+
+                        <div class="toggle-row">
+                            <div class="toggle-info">
+                                <div class="toggle-label">📲 Push Notifications</div>
+                                <div class="toggle-desc">Browser/mobile push notifications.</div>
+                            </div>
+                            <label class="switch">
+                                <input type="checkbox" name="settings[push_enabled]" value="1" <?= checked('push_enabled', $currentSettings) ?>>
+                                <span class="slider"></span>
+                            </label>
+                        </div>
+
+                        <div style="margin-top:16px;padding-top:16px;border-top:1px solid #f0f0f0;">
+                            <div style="font-size:12px;font-weight:600;color:#495057;text-transform:uppercase;letter-spacing:0.5px;margin-bottom:12px;">Event Triggers</div>
+
+                            <div class="toggle-row">
+                                <div class="toggle-info"><div class="toggle-label">New Incidents</div></div>
+                                <label class="switch">
+                                    <input type="checkbox" name="settings[notify_on_incident]" value="1" <?= checked('notify_on_incident', $currentSettings) ?>>
+                                    <span class="slider"></span>
+                                </label>
+                            </div>
+
+                            <div class="toggle-row">
+                                <div class="toggle-info"><div class="toggle-label">AI Alerts</div></div>
+                                <label class="switch">
+                                    <input type="checkbox" name="settings[notify_on_ai_alert]" value="1" <?= checked('notify_on_ai_alert', $currentSettings) ?>>
+                                    <span class="slider"></span>
+                                </label>
+                            </div>
+
+                            <div class="toggle-row">
+                                <div class="toggle-info"><div class="toggle-label">Alarm Triggers</div></div>
+                                <label class="switch">
+                                    <input type="checkbox" name="settings[notify_on_alarm]" value="1" <?= checked('notify_on_alarm', $currentSettings) ?>>
+                                    <span class="slider"></span>
+                                </label>
+                            </div>
+
+                            <div class="toggle-row">
+                                <div class="toggle-info"><div class="toggle-label">Manpower Requests</div></div>
+                                <label class="switch">
+                                    <input type="checkbox" name="settings[notify_on_manpower]" value="1" <?= checked('notify_on_manpower', $currentSettings) ?>>
+                                    <span class="slider"></span>
+                                </label>
+                            </div>
+
+                            <div class="toggle-row">
+                                <div class="toggle-info">
+                                    <div class="toggle-label">Remind Offline Users</div>
+                                    <div class="toggle-desc">Send reminders to users who have been offline for a while.</div>
+                                </div>
+                                <label class="switch">
+                                    <input type="checkbox" name="settings[notify_offline_users]" value="1" <?= checked('notify_offline_users', $currentSettings) ?>>
+                                    <span class="slider"></span>
+                                </label>
+                            </div>
+                        </div>
+                    </div>
+
+                    <!-- AI / CCTV -->
+                    <div class="section">
+                        <div class="section-header">
+                            <div>
+                                <h2>🤖 AI / CCTV</h2>
+                                <div class="section-desc">Configure AI detection thresholds and camera settings.</div>
+                            </div>
+                        </div>
+
+                        <div class="toggle-row">
+                            <div class="toggle-info">
+                                <div class="toggle-label">Enable AI Detection</div>
+                                <div class="toggle-desc">Master switch for the AI detection pipeline.</div>
+                            </div>
+                            <label class="switch">
+                                <input type="checkbox" name="settings[ai_enabled]" value="1" <?= checked('ai_enabled', $currentSettings) ?>>
+                                <span class="slider"></span>
+                            </label>
+                        </div>
+
+                        <div class="toggle-row">
+                            <div class="toggle-info">
+                                <div class="toggle-label">Auto-Create AI Alerts</div>
+                                <div class="toggle-desc">Automatically create alerts from threat detections.</div>
+                            </div>
+                            <label class="switch">
+                                <input type="checkbox" name="settings[ai_auto_create_alert]" value="1" <?= checked('ai_auto_create_alert', $currentSettings) ?>>
+                                <span class="slider"></span>
+                            </label>
+                        </div>
+
+                        <div class="toggle-row">
+                            <div class="toggle-info">
+                                <div class="toggle-label">Auto-Trigger Alarms</div>
+                                <div class="toggle-desc">Automatically trigger alarms on critical AI detections.</div>
+                            </div>
+                            <label class="switch">
+                                <input type="checkbox" name="settings[ai_auto_trigger_alarm]" value="1" <?= checked('ai_auto_trigger_alarm', $currentSettings) ?>>
+                                <span class="slider"></span>
+                            </label>
+                        </div>
+
+                        <div class="form-grid" style="margin-top:16px;">
+                            <div class="form-group">
+                                <label>Minimum Confidence (%)</label>
+                                <input type="number" name="settings[ai_confidence_min]" value="<?= val('ai_confidence_min', $currentSettings) ?>" min="0" max="100">
+                                <span class="hint">Detections below this threshold are ignored.</span>
+                            </div>
+                            <div class="form-group">
+                                <label>CCTV Retention (days)</label>
+                                <input type="number" name="settings[cctv_retention_days]" value="<?= val('cctv_retention_days', $currentSettings) ?>" min="1" max="365">
+                            </div>
+                            <div class="form-group">
+                                <label>Snapshot Directory</label>
+                                <input type="text" name="settings[cctv_snapshot_dir]" value="<?= val('cctv_snapshot_dir', $currentSettings) ?>" placeholder="uploads/cctv/">
+                            </div>
+                        </div>
+                    </div>
+
+                    <!-- SECURITY -->
+                    <div class="section">
+                        <div class="section-header">
+                            <div>
+                                <h2>🔒 Security</h2>
+                                <div class="section-desc">Password policy, session timeouts, and login protection.</div>
+                            </div>
+                        </div>
+
+                        <div class="form-grid">
+                            <div class="form-group">
+                                <label>Session Timeout (min)</label>
+                                <input type="number" name="settings[session_timeout_min]" value="<?= val('session_timeout_min', $currentSettings) ?>" min="5" max="1440">
+                                <span class="hint">Idle time before a user is logged out.</span>
+                            </div>
+                            <div class="form-group">
+                                <label>Min Password Length</label>
+                                <input type="number" name="settings[password_min_length]" value="<?= val('password_min_length', $currentSettings) ?>" min="6" max="32">
+                            </div>
+                            <div class="form-group">
+                                <label>Max Login Attempts</label>
+                                <input type="number" name="settings[login_max_attempts]" value="<?= val('login_max_attempts', $currentSettings) ?>" min="1" max="20">
+                            </div>
+                            <div class="form-group">
+                                <label>Lockout Duration (min)</label>
+                                <input type="number" name="settings[login_lockout_min]" value="<?= val('login_lockout_min', $currentSettings) ?>" min="1" max="1440">
+                            </div>
+                        </div>
+
+                        <div style="margin-top:16px;padding-top:16px;border-top:1px solid #f0f0f0;">
+                            <div style="font-size:12px;font-weight:600;color:#495057;text-transform:uppercase;letter-spacing:0.5px;margin-bottom:12px;">Password Requirements</div>
+
+                            <div class="toggle-row">
+                                <div class="toggle-info"><div class="toggle-label">Require Uppercase Letter</div></div>
+                                <label class="switch">
+                                    <input type="checkbox" name="settings[password_require_upper]" value="1" <?= checked('password_require_upper', $currentSettings) ?>>
+                                    <span class="slider"></span>
+                                </label>
+                            </div>
+
+                            <div class="toggle-row">
+                                <div class="toggle-info"><div class="toggle-label">Require Lowercase Letter</div></div>
+                                <label class="switch">
+                                    <input type="checkbox" name="settings[password_require_lower]" value="1" <?= checked('password_require_lower', $currentSettings) ?>>
+                                    <span class="slider"></span>
+                                </label>
+                            </div>
+
+                            <div class="toggle-row">
+                                <div class="toggle-info"><div class="toggle-label">Require Number</div></div>
+                                <label class="switch">
+                                    <input type="checkbox" name="settings[password_require_num]" value="1" <?= checked('password_require_num', $currentSettings) ?>>
+                                    <span class="slider"></span>
+                                </label>
+                            </div>
+
+                            <div class="toggle-row">
+                                <div class="toggle-info"><div class="toggle-label">Require Symbol</div></div>
+                                <label class="switch">
+                                    <input type="checkbox" name="settings[password_require_sym]" value="1" <?= checked('password_require_sym', $currentSettings) ?>>
+                                    <span class="slider"></span>
+                                </label>
+                            </div>
+                        </div>
+                    </div>
+
+                    <!-- MAINTENANCE -->
+                    <div class="section" style="border-left:4px solid #ffc107;">
+                        <div class="section-header">
+                            <div>
+                                <h2>🚧 Maintenance Mode</h2>
+                                <div class="section-desc">When enabled, only admins can access the system.</div>
+                            </div>
+                        </div>
+
+                        <div class="toggle-row">
+                            <div class="toggle-info">
+                                <div class="toggle-label">Enable Maintenance Mode</div>
+                                <div class="toggle-desc">All non-admin users will be redirected to <code>maintenance.php</code>.</div>
+                            </div>
+                            <label class="switch">
+                                <input type="checkbox" name="settings[maintenance_mode]" value="1" <?= checked('maintenance_mode', $currentSettings) ?>>
+                                <span class="slider"></span>
+                            </label>
+                        </div>
+
+                        <div class="form-group" style="margin-top:16px;">
+                            <label>Maintenance Message</label>
+                            <textarea name="settings[maintenance_message]" rows="3"><?= val('maintenance_message', $currentSettings) ?></textarea>
+                            <span class="hint">Shown to non-admin users on the maintenance page.</span>
+                        </div>
+                    </div>
+
+                    <!-- SAVE BAR -->
+                    <div class="save-bar">
+                        <div class="status" id="saveStatus">
+                            Changes take effect immediately after saving.
+                        </div>
+                        <div style="display:flex;gap:10px;">
+                            <button type="reset" class="btn btn-secondary">
+                                <i class="fas fa-rotate-left"></i> Reset Form
+                            </button>
+                            <button type="submit" class="btn btn-primary">
+                                <i class="fas fa-save"></i> Save Settings
+                            </button>
+                        </div>
+                    </div>
+                </form>
+
+                <!-- Info notice -->
+                <div class="section" style="border-left:4px solid #cce5ff;background:#f8fbff;margin-top:20px;">
+                    <div style="font-size:13px;color:#495057;line-height:1.7;">
+                        <strong>ℹ️ About Settings Storage</strong><br>
+                        • All settings are stored in the <code>settings</code> table as key/value pairs.<br>
+                        • Read any setting anywhere with <code>getSetting('site_name')</code>.<br>
+                        • The cache is refreshed automatically when you save.<br>
+                        • <b>Maintenance Mode</b> takes effect on every page that calls
+                          <code>enforceMaintenanceMode()</code> right after <code>requireLogin()</code>.<br>
+                        • <b>Session Timeout</b> takes effect on every page that calls
+                          <code>applySessionTimeout()</code>.
+                    </div>
+                </div>
+            </div>
+        </main>
+    </div>
+
+    <script src="../assets/js/app.js"></script>
+    <script src="../assets/js/transitions.js"></script>
+    <script>
+        // Mark the form as dirty when the user changes anything
+        (function () {
+            const form = document.getElementById('settingsForm');
+            const status = document.getElementById('saveStatus');
+            if (!form || !status) return;
+
+            let dirty = false;
+            form.addEventListener('input', () => {
+                if (!dirty) {
+                    dirty = true;
+                    status.textContent = '⚠️ You have unsaved changes.';
+                    status.classList.add('dirty');
+                }
+            });
+            form.addEventListener('change', () => {
+                if (!dirty) {
+                    dirty = true;
+                    status.textContent = '⚠️ You have unsaved changes.';
+                    status.classList.add('dirty');
+                }
+            });
+            // If the user resets or submits, drop the flag
+            form.addEventListener('reset', () => {
+                dirty = false;
+                status.textContent = 'Changes take effect immediately after saving.';
+                status.classList.remove('dirty');
+            });
+            form.addEventListener('submit', () => {
+                status.textContent = '⏳ Saving…';
+                status.classList.remove('dirty');
+            });
+        })();
+    </script>
+</body>
+</html>

@@ -1,0 +1,1278 @@
+<?php
+// ============================================================
+// admin/simulation.php
+// Wildlife Sentinel — Simulation Controls (Admin)
+// ============================================================
+// Features:
+//   - Run test simulations:
+//       • Fake incident report
+//       • Fake AI detection + alert
+//       • Fake alarm trigger
+//       • Fake ranger movement
+//       • Fake SMS
+//   - View simulation history
+//   - Enable / disable simulations per zone
+//   - Reset / clear simulation data
+//   - Honors global settings from admin/settings.php:
+//       ai_enabled, ai_confidence_min, ai_auto_create_alert,
+//       ai_auto_trigger_alarm, cctv_snapshot_dir,
+//       notify_on_incident, notify_on_ai_alert, notify_on_alarm,
+//       items_per_page
+// ============================================================
+
+require_once __DIR__ . '/../includes/functions.php';
+requireAdmin();
+
+$user = getCurrentUser();
+$pdo  = getDB();
+
+// ============================================================
+// SAFE HELPERS
+// ============================================================
+if (!function_exists('safeCount')) {
+    function safeCount(PDO $pdo, string $sql, array $params = []): int {
+        try {
+            $stmt = $pdo->prepare($sql);
+            $stmt->execute($params);
+            return (int)($stmt->fetch()['count'] ?? 0);
+        } catch (PDOException $e) { return 0; }
+    }
+}
+if (!function_exists('safeFetchAll')) {
+    function safeFetchAll(PDO $pdo, string $sql, array $params = []): array {
+        try {
+            $stmt = $pdo->prepare($sql);
+            $stmt->execute($params);
+            return $stmt->fetchAll();
+        } catch (PDOException $e) { return []; }
+    }
+}
+
+// ============================================================
+// GLOBAL SETTINGS (from admin/settings.php)
+// ============================================================
+if (!function_exists('ws_sim_setting')) {
+    function ws_sim_setting(string $key, $default = null) {
+        if (function_exists('getSetting')) {
+            $v = getSetting($key);
+            return $v !== null ? $v : $default;
+        }
+        try {
+            $stmt = getDB()->prepare("SELECT setting_value FROM settings WHERE setting_key = ? LIMIT 1");
+            $stmt->execute([$key]);
+            $row = $stmt->fetch();
+            return $row ? $row['setting_value'] : $default;
+        } catch (PDOException $e) {
+            return $default;
+        }
+    }
+}
+
+$setAiEnabled        = (string) ws_sim_setting('ai_enabled', '1')             === '1';
+$setAiConfidenceMin  = (int)    ws_sim_setting('ai_confidence_min', 70);
+$setAiAutoCreate     = (string) ws_sim_setting('ai_auto_create_alert', '1')  === '1';
+$setAiAutoAlarm      = (string) ws_sim_setting('ai_auto_trigger_alarm', '0') === '1';
+$setCctvSnapshotDir  = (string) ws_sim_setting('cctv_snapshot_dir', 'uploads/cctv/');
+$setNotifyIncident   = (string) ws_sim_setting('notify_on_incident', '1')    === '1';
+$setNotifyAiAlert    = (string) ws_sim_setting('notify_on_ai_alert', '1')    === '1';
+$setNotifyAlarm      = (string) ws_sim_setting('notify_on_alarm', '1')       === '1';
+$setNotifyManpower   = (string) ws_sim_setting('notify_on_manpower', '1')    === '1';
+
+$itemsPerPage = (int) ws_sim_setting('items_per_page', 25);
+if ($itemsPerPage < 5 || $itemsPerPage > 100) $itemsPerPage = 25;
+$historyLimit = $itemsPerPage;
+
+// ============================================================
+// AUTO-CREATE simulation_controls TABLE IF MISSING
+// ============================================================
+try {
+    $pdo->exec("
+        CREATE TABLE IF NOT EXISTS simulation_controls (
+            id INT(11) AUTO_INCREMENT PRIMARY KEY,
+            zone_id INT(11) NULL,
+            name VARCHAR(255) NOT NULL,
+            description TEXT NULL,
+            simulation_type ENUM('incident','ai_detection','alarm','sms','ranger_movement') NOT NULL,
+            is_enabled TINYINT(1) DEFAULT 0,
+            parameters JSON NULL,
+            started_at DATETIME NULL,
+            stopped_at DATETIME NULL,
+            created_by INT(11) NULL,
+            created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+            INDEX idx_zone (zone_id),
+            INDEX idx_enabled (is_enabled),
+            FOREIGN KEY (zone_id) REFERENCES zones(id) ON DELETE CASCADE,
+            FOREIGN KEY (created_by) REFERENCES users(id) ON DELETE SET NULL
+        ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
+    ");
+} catch (PDOException $e) {
+    error_log('[WS-SIM] create table: ' . $e->getMessage());
+}
+
+// ============================================================
+// NOTIFICATION GATE HELPERS
+// ============================================================
+if (!function_exists('ws_sim_notify')) {
+    /**
+     * Wraps createNotification() only when the relevant setting allows it.
+     * Returns true if a notification was sent, false if suppressed.
+     */
+    function ws_sim_notify(int $userId, string $type, string $title, string $body, ?int $incidentId = null): bool {
+        // Map notification type -> setting key
+        $map = [
+            'new_incident'     => 'notify_on_incident',
+            'system_alert'     => 'notify_on_ai_alert',   // used for AI + alarm in this page
+            'ai_alert'         => 'notify_on_ai_alert',
+            'alarm'            => 'notify_on_alarm',
+            'manpower_request' => 'notify_on_manpower',
+        ];
+        $key = $map[$type] ?? null;
+        if ($key !== null && function_exists('ws_sim_setting')) {
+            if ((string) ws_sim_setting($key, '1') !== '1') {
+                return false; // suppressed by setting
+            }
+        }
+        if (function_exists('createNotification')) {
+            try {
+                createNotification($userId, $type, $title, $body, $incidentId);
+                return true;
+            } catch (Throwable $e) {
+                error_log('[WS-SIM] notify failed: ' . $e->getMessage());
+                return false;
+            }
+        }
+        return false;
+    }
+}
+
+// ============================================================
+// SIMULATION RUNNER (defined BEFORE the POST handler)
+// ============================================================
+if (!function_exists('runSimulation')) {
+    function runSimulation(PDO $pdo, string $type, int $zoneId, array $user): array {
+        // Whitelist check
+        $allowed = ['incident', 'ai_detection', 'alarm', 'ranger_movement', 'sms'];
+        if (!in_array($type, $allowed, true)) {
+            return ['success' => false, 'error' => 'Unknown simulation type'];
+        }
+
+        // Read effective settings
+        $aiEnabled       = (string) ws_sim_setting('ai_enabled', '1')             === '1';
+        $aiConfidenceMin = (int)    ws_sim_setting('ai_confidence_min', 70);
+        $aiAutoCreate    = (string) ws_sim_setting('ai_auto_create_alert', '1')  === '1';
+        $aiAutoAlarm     = (string) ws_sim_setting('ai_auto_trigger_alarm', '0') === '1';
+        $snapshotDir     = (string) ws_sim_setting('cctv_snapshot_dir', 'uploads/cctv/');
+
+        // Zone lookup
+        $zoneStmt = $pdo->prepare("SELECT * FROM zones WHERE id = ?");
+        $zoneStmt->execute([$zoneId]);
+        $zone = $zoneStmt->fetch();
+        if (!$zone) {
+            return ['success' => false, 'error' => 'Zone not found'];
+        }
+
+        // Random reporter
+        $reporterStmt = $pdo->prepare("
+            SELECT id, full_name FROM users
+            WHERE zone_id = ? AND is_active = 1 AND role IN ('scout','tourism')
+            ORDER BY RAND() LIMIT 1
+        ");
+        $reporterStmt->execute([$zoneId]);
+        $reporter = $reporterStmt->fetch();
+
+        $reporterId   = $reporter['id'] ?? $user['id'];
+        $reporterType = $reporter ? 'scout' : 'tourism';
+
+        // Random coordinates near zone center
+        $lat = $zone['boundary_center_lat'] ?: ($zone['center_lat'] ?? -13.0);
+        $lng = $zone['boundary_center_lng'] ?: ($zone['center_lng'] ?? 31.5);
+        $lat += (mt_rand(-500, 500) / 10000);
+        $lng += (mt_rand(-500, 500) / 10000);
+
+        // ============= INCIDENT SIMULATION =============
+        if ($type === 'incident') {
+            $categories = ['poaching', 'distressed_animal', 'human_wildlife_conflict', 'environmental_risk'];
+            $severities = ['low', 'medium', 'high', 'critical'];
+            $category = $categories[array_rand($categories)];
+            $severity = $severities[array_rand($severities)];
+
+            $desc = "[SIMULATED] " . ucfirst(str_replace('_', ' ', $category)) . " reported at " . date('H:i');
+            $geojson = "POINT($lng $lat)";
+
+            try {
+                $stmt = $pdo->prepare("
+                    INSERT INTO incidents
+                        (reporter_id, reporter_type, zone_id, category, severity,
+                         description, location_lat, location_lng, location_geojson,
+                         status, reported_at, is_simulated)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ST_GeomFromText(?), 'reported', NOW(), 1)
+                ");
+                $stmt->execute([
+                    $reporterId, $reporterType, $zoneId, $category, $severity,
+                    $desc, $lat, $lng, $geojson,
+                ]);
+            } catch (PDOException $e) {
+                // Retry without is_simulated column (older schema)
+                try {
+                    $stmt = $pdo->prepare("
+                        INSERT INTO incidents
+                            (reporter_id, reporter_type, zone_id, category, severity,
+                             description, location_lat, location_lng,
+                             status, reported_at)
+                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'reported', NOW())
+                    ");
+                    $stmt->execute([
+                        $reporterId, $reporterType, $zoneId, $category, $severity,
+                        $desc, $lat, $lng,
+                    ]);
+                } catch (PDOException $e2) {
+                    return ['success' => false, 'error' => 'Incident insert failed: ' . $e2->getMessage()];
+                }
+            }
+            $incidentId = (int)$pdo->lastInsertId();
+
+            // Notify rangers (gated by notify_on_incident)
+            $notified = 0; $suppressed = 0;
+            $rangers = $pdo->prepare("SELECT id FROM users WHERE zone_id = ? AND role = 'ranger' AND is_active = 1");
+            $rangers->execute([$zoneId]);
+            foreach ($rangers->fetchAll(PDO::FETCH_COLUMN) as $rid) {
+                if (ws_sim_notify((int)$rid, 'new_incident', '🚨 [SIM] New Incident', $desc, $incidentId)) {
+                    $notified++;
+                } else {
+                    $suppressed++;
+                }
+            }
+
+            if (function_exists('broadcastToWS')) {
+                try {
+                    broadcastToWS('new-incident', [
+                        'zone_id'   => $zoneId,
+                        'id'        => $incidentId,
+                        'category'  => $category,
+                        'severity'  => $severity,
+                        'zone_name' => $zone['name'],
+                    ]);
+                } catch (Throwable $e) { /* silent */ }
+            }
+
+            $notifyNote = $notified > 0
+                ? " • {$notified} ranger(s) notified"
+                : ($suppressed > 0 ? ' • notifications suppressed by settings' : '');
+
+            return [
+                'success' => true,
+                'label'   => 'Fake Incident',
+                'detail'  => "Created incident #{$incidentId} ({$category}, {$severity}) at {$lat}, {$lng}{$notifyNote}",
+                'params'  => [
+                    'incident_id' => $incidentId,
+                    'category'    => $category,
+                    'severity'    => $severity,
+                    'notified'    => $notified,
+                    'suppressed'  => $suppressed,
+                ],
+            ];
+        }
+
+        // ============= AI DETECTION SIMULATION =============
+        if ($type === 'ai_detection') {
+            if (!$aiEnabled) {
+                return [
+                    'success' => false,
+                    'error'   => 'AI is globally disabled (ai_enabled = 0). Enable it in System Settings to run AI simulations.',
+                ];
+            }
+
+            $types = ['human', 'animal', 'vehicle'];
+            $detType = $types[array_rand($types)];
+            $isThreat = ($detType === 'human' && mt_rand(0, 1) === 1);
+            $threatLevel = $isThreat ? ['low','medium','high','critical'][array_rand(['low','medium','high','critical'])] : 'low';
+
+            // Confidence respects floor (generate above it so it's a valid detection)
+            $floor = max(1, min(99, $aiConfidenceMin));
+            $confidence = mt_rand($floor, 99) / 100;
+
+            // Camera in the zone (create virtual if none)
+            $camStmt = $pdo->prepare("SELECT id FROM cctv_cameras WHERE zone_id = ? AND is_active = 1 LIMIT 1");
+            $camStmt->execute([$zoneId]);
+            $camera = $camStmt->fetch();
+
+            if (!$camera) {
+                try {
+                    $pdo->prepare("
+                        INSERT INTO cctv_cameras
+                            (zone_id, camera_name, camera_code, camera_type, is_active, is_recording, created_at)
+                        VALUES (?, ?, ?, 'fixed', 1, 1, NOW())
+                    ")->execute([$zoneId, "[SIM] Virtual Camera", "SIM-" . time()]);
+                    $cameraId = (int)$pdo->lastInsertId();
+                } catch (PDOException $e) {
+                    return ['success' => false, 'error' => 'No camera available and could not create virtual one'];
+                }
+            } else {
+                $cameraId = (int)$camera['id'];
+            }
+
+            // Detection row (snapshot url uses configured dir)
+            $snapshotUrl = rtrim($snapshotDir, '/') . '/SIM-' . uniqid() . '.jpg';
+
+            $stmt = $pdo->prepare("
+                INSERT INTO ai_detections
+                    (camera_id, zone_id, detection_type, confidence, is_threat, threat_level,
+                     snapshot_url, location_lat, location_lng, detected_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, NOW())
+            ");
+            $stmt->execute([
+                $cameraId, $zoneId, $detType, $confidence, $isThreat ? 1 : 0, $threatLevel,
+                $snapshotUrl, $lat, $lng,
+            ]);
+            $detectionId = (int)$pdo->lastInsertId();
+
+            // Alert created only if threat AND auto-create is on
+            $alertId = null;
+            $alertNote = '';
+            if ($isThreat) {
+                if (!$aiAutoCreate) {
+                    $alertNote = ' • alert NOT created (ai_auto_create_alert = OFF)';
+                } else {
+                    $alertTypes = ['poaching_suspect', 'intruder', 'animal_distress'];
+                    $alertType = $alertTypes[array_rand($alertTypes)];
+
+                    $stmt = $pdo->prepare("
+                        INSERT INTO ai_alerts
+                            (detection_id, zone_id, alert_type, severity, title, description,
+                             location_lat, location_lng, is_acknowledged, created_at)
+                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, 0, NOW())
+                    ");
+                    $stmt->execute([
+                        $detectionId, $zoneId, $alertType, $threatLevel,
+                        "[SIM] " . ucfirst(str_replace('_', ' ', $alertType)),
+                        "Simulated AI detection: {$detType} detected with " . round($confidence * 100) . "% confidence",
+                        $lat, $lng,
+                    ]);
+                    $alertId = (int)$pdo->lastInsertId();
+
+                    // Notify rangers + supervisors (gated by notify_on_ai_alert)
+                    $notified = 0; $suppressed = 0;
+                    $recipients = $pdo->prepare("
+                        SELECT id FROM users
+                        WHERE zone_id = ? AND role IN ('ranger','zone_supervisor') AND is_active = 1
+                    ");
+                    $recipients->execute([$zoneId]);
+                    foreach ($recipients->fetchAll(PDO::FETCH_COLUMN) as $uid) {
+                        if (ws_sim_notify((int)$uid, 'system_alert', '🤖 [SIM] AI Threat Detected', "Threat detected in {$zone['name']} — {$alertType}", null)) {
+                            $notified++;
+                        } else {
+                            $suppressed++;
+                        }
+                    }
+                    $alertNote = $notified > 0
+                        ? " • {$notified} notified"
+                        : ($suppressed > 0 ? ' • notifications suppressed by settings' : '');
+
+                    // Auto-trigger alarm if setting is on
+                    if ($aiAutoAlarm && $threatLevel === 'critical') {
+                        try {
+                            $alarmStmt = $pdo->prepare("SELECT id FROM alarm_systems WHERE zone_id = ? AND is_active = 1 LIMIT 1");
+                            $alarmStmt->execute([$zoneId]);
+                            $alarm = $alarmStmt->fetch();
+                            $alarmId = $alarm['id'] ?? null;
+
+                            if (!$alarmId) {
+                                $pdo->prepare("
+                                    INSERT INTO alarm_systems
+                                        (zone_id, alarm_name, alarm_type, is_active, trigger_count, created_at)
+                                    VALUES (?, ?, 'siren', 1, 0, NOW())
+                                ")->execute([$zoneId, "[SIM] Auto Siren"]);
+                                $alarmId = (int)$pdo->lastInsertId();
+                            }
+
+                            $pdo->prepare("
+                                INSERT INTO alarm_triggers
+                                    (alarm_id, alert_id, zone_id, triggered_by, trigger_reason, triggered_at)
+                                VALUES (?, ?, ?, 'ai_detection', ?, NOW())
+                            ")->execute([$alarmId, $alertId, $zoneId, '[SIM] Auto-triggered by AI']);
+
+                            $pdo->prepare("
+                                UPDATE alarm_systems
+                                SET last_triggered = NOW(), trigger_count = trigger_count + 1
+                                WHERE id = ?
+                            ")->execute([$alarmId]);
+
+                            $alertNote .= ' • alarm auto-triggered';
+                        } catch (Throwable $e) {
+                            error_log('[WS-SIM] auto-alarm failed: ' . $e->getMessage());
+                        }
+                    }
+                }
+
+                if (function_exists('broadcastToWS')) {
+                    try {
+                        broadcastToWS('ai-anomaly', [
+                            'zone_id'     => $zoneId,
+                            'type'        => $alertType ?? 'other',
+                            'severity'    => $threatLevel,
+                            'description' => "Simulated AI detection: {$detType}",
+                        ]);
+                    } catch (Throwable $e) { /* silent */ }
+                }
+            }
+
+            return [
+                'success' => true,
+                'label'   => 'Fake AI Detection',
+                'detail'  => "Detection #{$detectionId} ({$detType}, " . round($confidence * 100) . "%)" .
+                             ($alertId ? " + alert #{$alertId}" : "") .
+                             $alertNote,
+                'params'  => [
+                    'detection_id' => $detectionId,
+                    'alert_id'     => $alertId,
+                    'confidence'   => $confidence,
+                    'is_threat'    => $isThreat,
+                ],
+            ];
+        }
+
+        // ============= ALARM SIMULATION =============
+        if ($type === 'alarm') {
+            $alarmStmt = $pdo->prepare("SELECT id, alarm_name FROM alarm_systems WHERE zone_id = ? AND is_active = 1 LIMIT 1");
+            $alarmStmt->execute([$zoneId]);
+            $alarm = $alarmStmt->fetch();
+
+            if (!$alarm) {
+                try {
+                    $pdo->prepare("
+                        INSERT INTO alarm_systems
+                            (zone_id, alarm_name, alarm_type, is_active, trigger_count, created_at)
+                        VALUES (?, ?, 'siren', 1, 0, NOW())
+                    ")->execute([$zoneId, "[SIM] Test Siren"]);
+                    $alarmId   = (int)$pdo->lastInsertId();
+                    $alarmName = "[SIM] Test Siren";
+                } catch (PDOException $e) {
+                    return ['success' => false, 'error' => 'No alarm available and could not create virtual one'];
+                }
+            } else {
+                $alarmId   = (int)$alarm['id'];
+                $alarmName = $alarm['alarm_name'];
+            }
+
+            $stmt = $pdo->prepare("
+                INSERT INTO alarm_triggers
+                    (alarm_id, zone_id, triggered_by, trigger_reason, triggered_at)
+                VALUES (?, ?, 'manual', ?, NOW())
+            ");
+            $stmt->execute([$alarmId, $zoneId, '[SIM] Manual test trigger']);
+            $triggerId = (int)$pdo->lastInsertId();
+
+            $pdo->prepare("
+                UPDATE alarm_systems
+                SET last_triggered = NOW(), trigger_count = trigger_count + 1
+                WHERE id = ?
+            ")->execute([$alarmId]);
+
+            // Notify (gated by notify_on_alarm)
+            $notified = 0; $suppressed = 0;
+            $recipients = $pdo->prepare("
+                SELECT id FROM users
+                WHERE zone_id = ? AND role IN ('ranger','zone_supervisor') AND is_active = 1
+            ");
+            $recipients->execute([$zoneId]);
+            foreach ($recipients->fetchAll(PDO::FETCH_COLUMN) as $uid) {
+                if (ws_sim_notify((int)$uid, 'alarm', '🔔 [SIM] Alarm Triggered', "{$alarmName} triggered in {$zone['name']}", null)) {
+                    $notified++;
+                } else {
+                    $suppressed++;
+                }
+            }
+
+            if (function_exists('broadcastToWS')) {
+                try {
+                    broadcastToWS('alarm-triggered', [
+                        'zone_id'    => $zoneId,
+                        'alarm_id'   => $alarmId,
+                        'alarm_name' => $alarmName,
+                    ]);
+                } catch (Throwable $e) { /* silent */ }
+            }
+
+            $notifyNote = $notified > 0
+                ? " • {$notified} notified"
+                : ($suppressed > 0 ? ' • notifications suppressed by settings' : '');
+
+            return [
+                'success' => true,
+                'label'   => 'Fake Alarm',
+                'detail'  => "Triggered alarm '{$alarmName}' (trigger #{$triggerId}){$notifyNote}",
+                'params'  => ['alarm_id' => $alarmId, 'trigger_id' => $triggerId, 'notified' => $notified],
+            ];
+        }
+
+        // ============= RANGER MOVEMENT SIMULATION =============
+        if ($type === 'ranger_movement') {
+            $rangerStmt = $pdo->prepare("
+                SELECT id, full_name FROM users
+                WHERE zone_id = ? AND role = 'ranger' AND is_active = 1
+                ORDER BY RAND() LIMIT 1
+            ");
+            $rangerStmt->execute([$zoneId]);
+            $ranger = $rangerStmt->fetch();
+
+            if (!$ranger) {
+                return ['success' => false, 'error' => 'No ranger found in this zone'];
+            }
+
+            $heading = mt_rand(0, 359);
+            $speed   = mt_rand(1, 6) + (mt_rand(0, 99) / 100);
+
+            try {
+                $pdo->prepare("
+                    INSERT INTO ranger_live_tracking
+                        (ranger_id, current_lat, current_lng, heading, speed, last_update, is_offline)
+                    VALUES (?, ?, ?, ?, ?, NOW(), 0)
+                    ON DUPLICATE KEY UPDATE
+                        current_lat = VALUES(current_lat),
+                        current_lng = VALUES(current_lng),
+                        heading     = VALUES(heading),
+                        speed       = VALUES(speed),
+                        last_update = NOW(),
+                        is_offline  = 0
+                ")->execute([$ranger['id'], $lat, $lng, $heading, $speed]);
+
+                $pdo->prepare("
+                    INSERT INTO ranger_location_history
+                        (ranger_id, lat, lng, heading, speed, timestamp)
+                    VALUES (?, ?, ?, ?, ?, NOW())
+                ")->execute([$ranger['id'], $lat, $lng, $heading, $speed]);
+            } catch (PDOException $e) {
+                return ['success' => false, 'error' => 'Tracking insert failed: ' . $e->getMessage()];
+            }
+
+            if (function_exists('broadcastToWS')) {
+                try {
+                    broadcastToWS('ranger-location', [
+                        'zone_id'   => $zoneId,
+                        'ranger_id' => (int)$ranger['id'],
+                        'location'  => [
+                            'lat'     => (float)$lat,
+                            'lng'     => (float)$lng,
+                            'heading' => (float)$heading,
+                            'speed'   => (float)$speed,
+                        ],
+                    ]);
+                } catch (Throwable $e) { /* silent */ }
+            }
+
+            return [
+                'success' => true,
+                'label'   => 'Fake Ranger Movement',
+                'detail'  => "Moved {$ranger['full_name']} to {$lat}, {$lng} (speed {$speed} m/s, heading {$heading}°)",
+                'params'  => ['ranger_id' => (int)$ranger['id'], 'lat' => $lat, 'lng' => $lng],
+            ];
+        }
+
+        // ============= SMS SIMULATION =============
+        if ($type === 'sms') {
+            $phone   = '0971' . mt_rand(100000, 999999);
+            $message = "[SIM] Test SMS from Wildlife Sentinel at " . date('H:i:s');
+
+            try {
+                $pdo->prepare("
+                    INSERT INTO sms_logs
+                        (user_id, phone, message, message_type, status, created_at)
+                    VALUES (?, ?, ?, 'test', 'sent', NOW())
+                ")->execute([$user['id'], $phone, $message]);
+                $smsId = (int)$pdo->lastInsertId();
+            } catch (PDOException $e) {
+                return ['success' => false, 'error' => 'Could not insert SMS log: ' . $e->getMessage()];
+            }
+
+            return [
+                'success' => true,
+                'label'   => 'Fake SMS',
+                'detail'  => "Sent test SMS to {$phone} (log #{$smsId})",
+                'params'  => ['sms_id' => $smsId, 'phone' => $phone],
+            ];
+        }
+
+        return ['success' => false, 'error' => 'Unknown simulation type'];
+    }
+}
+
+// ============================================================
+// HANDLE ACTIONS
+// ============================================================
+$message     = '';
+$messageType = 'success';
+
+if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['action'])) {
+    $action = $_POST['action'];
+
+    // -------- RUN SIMULATION --------
+    if ($action === 'run') {
+        $simType = $_POST['simulation_type'] ?? '';
+        $zoneId  = (int)($_POST['zone_id'] ?? 0);
+
+        if (!$zoneId) {
+            $message = 'Zone is required.';
+            $messageType = 'danger';
+        } else {
+            try {
+                $result = runSimulation($pdo, $simType, $zoneId, $user);
+
+                if ($result['success']) {
+                    $message = "✅ Simulation '{$result['label']}' executed. " . $result['detail'];
+                    logAudit($user['id'], 'run_simulation', [
+                        'type'    => $simType,
+                        'zone_id' => $zoneId,
+                        'result'  => $result['detail'],
+                    ]);
+
+                    try {
+                        $pdo->prepare("
+                            INSERT INTO simulation_controls
+                                (zone_id, name, description, simulation_type, is_enabled, parameters, started_at, created_by, created_at)
+                            VALUES (?, ?, ?, ?, 0, ?, NOW(), ?, NOW())
+                        ")->execute([
+                            $zoneId,
+                            $result['label'],
+                            $result['detail'],
+                            $simType,
+                            json_encode($result['params'] ?? []),
+                            $user['id'],
+                        ]);
+                    } catch (PDOException $e) {
+                        error_log('[WS-SIM] history insert: ' . $e->getMessage());
+                    }
+                } else {
+                    $message = 'Simulation failed: ' . ($result['error'] ?? 'Unknown error');
+                    $messageType = 'danger';
+                }
+            } catch (Throwable $e) {
+                $message = 'Simulation error: ' . $e->getMessage();
+                $messageType = 'danger';
+            }
+        }
+    }
+
+    // -------- CLEAR ALL SIMULATED DATA --------
+    if ($action === 'clear_simulated') {
+        try {
+            $deleted = [
+                'incidents'     => 0,
+                'ai_detections' => 0,
+                'ai_alerts'     => 0,
+                'alarm_triggers'=> 0,
+                'sms'           => 0,
+            ];
+
+            try {
+                $stmt = $pdo->prepare("DELETE FROM incidents WHERE is_simulated = 1");
+                $stmt->execute();
+                $deleted['incidents'] = $stmt->rowCount();
+            } catch (PDOException $e) {}
+
+            try {
+                $stmt = $pdo->prepare("DELETE FROM ai_detections WHERE snapshot_url LIKE '%SIM-%'");
+                $stmt->execute();
+                $deleted['ai_detections'] = $stmt->rowCount();
+            } catch (PDOException $e) {}
+
+            try {
+                $stmt = $pdo->prepare("DELETE FROM ai_alerts WHERE title LIKE '[SIM]%'");
+                $stmt->execute();
+                $deleted['ai_alerts'] = $stmt->rowCount();
+            } catch (PDOException $e) {}
+
+            try {
+                $stmt = $pdo->prepare("DELETE FROM alarm_triggers WHERE trigger_reason LIKE '[SIM]%'");
+                $stmt->execute();
+                $deleted['alarm_triggers'] = $stmt->rowCount();
+            } catch (PDOException $e) {}
+
+            try {
+                $stmt = $pdo->prepare("DELETE FROM sms_logs WHERE message_type = 'test' AND message LIKE '[SIM]%'");
+                $stmt->execute();
+                $deleted['sms'] = $stmt->rowCount();
+            } catch (PDOException $e) {}
+
+            $total = array_sum($deleted);
+            $message = "🧹 Cleared {$total} simulated records "
+                     . "(incidents: {$deleted['incidents']}, "
+                     . "detections: {$deleted['ai_detections']}, "
+                     . "alerts: {$deleted['ai_alerts']}, "
+                     . "alarm triggers: {$deleted['alarm_triggers']}, "
+                     . "SMS: {$deleted['sms']})";
+            logAudit($user['id'], 'clear_simulations', $deleted);
+        } catch (Throwable $e) {
+            $message = 'Clear error: ' . $e->getMessage();
+            $messageType = 'danger';
+        }
+    }
+
+    // -------- DELETE HISTORY ENTRY --------
+    if ($action === 'delete_history') {
+        $id = (int)($_POST['history_id'] ?? 0);
+        try {
+            $pdo->prepare("DELETE FROM simulation_controls WHERE id = ?")->execute([$id]);
+            $message = 'Simulation history entry deleted.';
+            logAudit($user['id'], 'delete_simulation_history', ['id' => $id]);
+        } catch (PDOException $e) {
+            $message = 'Error: ' . $e->getMessage();
+            $messageType = 'danger';
+        }
+    }
+
+    // -------- CLEAR HISTORY ONLY --------
+    if ($action === 'clear_history') {
+        try {
+            $stmt = $pdo->prepare("DELETE FROM simulation_controls");
+            $stmt->execute();
+            $n = $stmt->rowCount();
+            $message = "🧹 Cleared {$n} simulation history entries (data records untouched).";
+            logAudit($user['id'], 'clear_simulation_history', ['count' => $n]);
+        } catch (PDOException $e) {
+            $message = 'Error: ' . $e->getMessage();
+            $messageType = 'danger';
+        }
+    }
+}
+
+// ============================================================
+// FETCH HISTORY (with type filter)
+// ============================================================
+$filterHistType = $_GET['hist_type'] ?? '';
+$histWhere  = '';
+$histParams = [];
+if ($filterHistType !== '' && in_array($filterHistType, ['incident','ai_detection','alarm','sms','ranger_movement'], true)) {
+    $histWhere = 'WHERE sc.simulation_type = ?';
+    $histParams[] = $filterHistType;
+}
+
+$history = safeFetchAll($pdo, "
+    SELECT sc.*, z.name AS zone_name, u.full_name AS created_by_name
+    FROM simulation_controls sc
+    LEFT JOIN zones z ON sc.zone_id = z.id
+    LEFT JOIN users u ON sc.created_by = u.id
+    {$histWhere}
+    ORDER BY sc.created_at DESC
+    LIMIT " . (int)$historyLimit . "
+", $histParams);
+
+// ============================================================
+// STATS
+// ============================================================
+$stats = [
+    'total_runs'     => safeCount($pdo, "SELECT COUNT(*) as count FROM simulation_controls"),
+    'sim_incidents'  => safeCount($pdo, "SELECT COUNT(*) as count FROM incidents WHERE is_simulated = 1"),
+    'sim_detections' => safeCount($pdo, "SELECT COUNT(*) as count FROM ai_detections WHERE snapshot_url LIKE '%SIM-%'"),
+    'sim_alerts'     => safeCount($pdo, "SELECT COUNT(*) as count FROM ai_alerts WHERE title LIKE '[SIM]%'"),
+    'sim_alarms'     => safeCount($pdo, "SELECT COUNT(*) as count FROM alarm_triggers WHERE trigger_reason LIKE '[SIM]%'"),
+    'sim_sms'        => safeCount($pdo, "SELECT COUNT(*) as count FROM sms_logs WHERE message_type = 'test' AND message LIKE '[SIM]%'"),
+];
+
+// ============================================================
+// ZONES
+// ============================================================
+$zones = safeFetchAll($pdo, "
+    SELECT id, name, park_type, center_lat, center_lng
+    FROM zones WHERE is_active = 1
+    ORDER BY name
+");
+
+// ============================================================
+// TYPE ICONS
+// ============================================================
+$typeIcons = [
+    'incident'        => '🚨',
+    'ai_detection'    => '🤖',
+    'alarm'           => '🔔',
+    'sms'             => '📱',
+    'ranger_movement' => '🛤️',
+];
+?>
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+    <title>Simulation - Admin - Wildlife Sentinel</title>
+
+    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css">
+    <link rel="stylesheet" href="../assets/css/style.css">
+    <link rel="stylesheet" href="../assets/css/transitions.css">
+
+    <style>
+        .dashboard-greeting { margin-bottom: 24px; }
+        .dashboard-greeting h1 { font-size: 28px; color: #0d3b22; }
+        .dashboard-greeting p  { color: #6c757d; font-size: 16px; }
+
+        .stats-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); gap: 14px; margin-bottom: 24px; }
+        .stat-card { background: white; border-radius: 12px; padding: 16px 18px; box-shadow: 0 2px 8px rgba(0,0,0,0.06); display: flex; align-items: center; gap: 12px; border: 1px solid #f0f0f0; transition: all 0.3s; }
+        .stat-card:hover { transform: translateY(-3px); box-shadow: 0 8px 25px rgba(0,0,0,0.1); }
+        .stat-card .icon { width: 44px; height: 44px; border-radius: 10px; display: flex; align-items: center; justify-content: center; font-size: 20px; flex-shrink: 0; }
+        .stat-card .icon.blue   { background: #cce5ff; color: #004085; }
+        .stat-card .icon.green  { background: #d4edda; color: #155724; }
+        .stat-card .icon.red    { background: #f8d7da; color: #721c24; }
+        .stat-card .icon.orange { background: #fff3cd; color: #856404; }
+        .stat-card .icon.purple { background: #e8d5f5; color: #6f42c1; }
+        .stat-card .icon.teal   { background: #d1ecf1; color: #0c5460; }
+        .stat-card .info .number { font-size: 22px; font-weight: 700; color: #0d3b22; }
+        .stat-card .info .label  { font-size: 11px; color: #6c757d; }
+
+        .section { background: white; border-radius: 14px; padding: 20px 22px; margin-bottom: 20px; box-shadow: 0 2px 12px rgba(0,0,0,0.06); border: 1px solid #f0f0f0; }
+        .section-header { display: flex; justify-content: space-between; align-items: center; margin-bottom: 14px; flex-wrap: wrap; gap: 10px; }
+        .section-header h2 { font-size: 17px; color: #0d3b22; display: flex; align-items: center; gap: 10px; }
+        .section-header .header-actions { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
+
+        .btn { padding: 9px 18px; border-radius: 8px; border: none; cursor: pointer; font-size: 13px; font-weight: 600; transition: all 0.2s; text-decoration: none; display: inline-flex; align-items: center; gap: 6px; }
+        .btn-primary { background: #1a5c3a; color: white; }
+        .btn-primary:hover { background: #0d3b22; }
+        .btn-secondary { background: #f0f0f0; color: #495057; }
+        .btn-danger { background: #dc3545; color: white; }
+        .btn-danger:hover { background: #c62828; }
+        .btn-success { background: #28a745; color: white; }
+        .btn-warning { background: #ffc107; color: #212529; }
+        .btn-sm { padding: 6px 12px; font-size: 12px; }
+        .btn:disabled { opacity: .5; cursor: not-allowed; }
+
+        .alert { padding: 12px 16px; border-radius: 10px; margin-bottom: 16px; font-size: 14px; }
+        .alert.success { background: #d4edda; color: #155724; }
+        .alert.danger  { background: #f8d7da; color: #721c24; }
+        .alert.info    { background: #d1ecf1; color: #0c5460; }
+
+        /* Simulation cards */
+        .sim-grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(240px, 1fr));
+            gap: 16px;
+        }
+
+        .sim-card {
+            background: #fafafa; border-radius: 12px;
+            padding: 20px; border: 2px solid #f0f0f0;
+            transition: all 0.2s;
+            display: flex; flex-direction: column;
+            align-items: center; text-align: center;
+        }
+        .sim-card:hover {
+            border-color: #1a5c3a;
+            background: white;
+            transform: translateY(-3px);
+            box-shadow: 0 8px 25px rgba(0,0,0,0.08);
+        }
+        .sim-card.blocked {
+            opacity: .65;
+            border-color: #f8d7da;
+        }
+        .sim-card.blocked:hover { transform: none; }
+        .sim-card .sim-icon {
+            font-size: 44px; margin-bottom: 10px;
+        }
+        .sim-card .sim-title {
+            font-weight: 700; font-size: 15px;
+            color: #0d3b22; margin-bottom: 6px;
+        }
+        .sim-card .sim-desc {
+            font-size: 12px; color: #6c757d;
+            margin-bottom: 10px; min-height: 32px;
+        }
+        .sim-card .sim-note {
+            font-size: 10.5px; color: #856404;
+            background: #fff3cd; padding: 4px 8px;
+            border-radius: 8px; margin-bottom: 10px;
+            width: 100%;
+        }
+        .sim-card .sim-action {
+            padding: 8px 20px; border-radius: 8px;
+            background: #1a5c3a; color: white;
+            font-size: 12px; font-weight: 600;
+            border: none; cursor: pointer;
+            transition: all 0.2s;
+        }
+        .sim-card .sim-action:hover { background: #0d3b22; }
+        .sim-card .sim-action:disabled { background: #adb5bd; cursor: not-allowed; }
+
+        /* Zone selector */
+        .zone-selector {
+            padding: 10px 14px; border: 1px solid #e0e0e0;
+            border-radius: 8px; font-size: 13px;
+            background: white; width: 100%;
+            margin-bottom: 12px;
+        }
+
+        /* Settings echo banner */
+        .settings-echo {
+            background: #eef7f1; border: 1px solid #c3e6cb;
+            border-radius: 10px; padding: 12px 16px;
+            margin-bottom: 16px; font-size: 12.5px;
+            color: #155724;
+        }
+        .settings-echo strong { color: #0d3b22; }
+        .settings-echo code { font-size: 11.5px; background: rgba(255,255,255,.6); padding: 1px 6px; border-radius: 4px; }
+        .settings-echo .off { color: #721c24; font-weight: 700; }
+
+        /* History table */
+        .history-table { width: 100%; border-collapse: collapse; }
+        .history-table thead th {
+            text-align: left; font-size: 11px; color: #6c757d;
+            text-transform: uppercase; letter-spacing: 0.5px;
+            padding: 10px 12px; border-bottom: 2px solid #f0f0f0;
+            background: #fafafa; font-weight: 700;
+        }
+        .history-table tbody tr { border-bottom: 1px solid #f5f5f5; }
+        .history-table tbody tr:hover { background: #fafafa; }
+        .history-table td { padding: 12px; font-size: 13px; vertical-align: middle; }
+
+        .type-pill {
+            display: inline-flex; align-items: center; gap: 4px;
+            padding: 3px 10px; border-radius: 12px;
+            font-size: 11px; font-weight: 600;
+            background: #f0f7f4; color: #0d3b22;
+        }
+
+        .empty-state { text-align:center; padding:40px 20px; color:#6c757d; }
+        .empty-state .icon { font-size: 48px; display: block; margin-bottom: 10px; opacity: 0.4; }
+
+        /* Warning banner */
+        .warning-banner {
+            background: #fff3cd; color: #856404;
+            border-left: 4px solid #ffc107;
+            border-radius: 10px; padding: 14px 18px;
+            margin-bottom: 20px; font-size: 13px;
+        }
+        .warning-banner strong { display: block; margin-bottom: 4px; }
+
+        /* Quick nav */
+        .quick-nav { display: flex; gap: 8px; flex-wrap: wrap; margin-bottom: 16px; }
+        .quick-nav .btn { font-size: 12px; padding: 6px 12px; }
+
+        @media (max-width: 1024px) {
+            .history-table thead { display: none; }
+            .history-table, .history-table tbody, .history-table tr, .history-table td { display: block; width: 100%; }
+            .history-table tr { margin-bottom: 12px; padding: 12px; border-radius: 10px; background: #fafafa; border: 1px solid #f0f0f0; }
+            .history-table td { padding: 4px 0; border: none; }
+            .history-table td::before { content: attr(data-label); font-size: 10px; text-transform: uppercase; color: #adb5bd; display: block; margin-bottom: 2px; }
+        }
+        @media (max-width: 768px) {
+            .stats-grid { grid-template-columns: 1fr 1fr; gap: 10px; }
+            .dashboard-greeting h1 { font-size: 22px; }
+        }
+    </style>
+</head>
+<body>
+    <div class="app-container">
+        <?php include '../includes/sidebar.php'; ?>
+
+        <main class="main-content">
+            <header class="top-header">
+                <button class="menu-toggle" onclick="toggleSidebar()">☰</button>
+                <h1>Simulation</h1>
+                <div class="header-right">
+                    <span class="online-status">● Online</span>
+                    <span class="data-honesty-badge">🟢 Live Data</span>
+                    <span class="user-name"><?= htmlspecialchars($user['full_name']) ?></span>
+                </div>
+            </header>
+
+            <div class="content">
+                <div class="dashboard-greeting">
+                    <h1>🎮 Simulation Controls</h1>
+                    <p>Run test scenarios to verify the system without affecting real operations.</p>
+                </div>
+
+                <!-- Quick nav -->
+                <div class="quick-nav">
+                    <a href="ai-dashboard.php" class="btn btn-secondary">🤖 AI Dashboard</a>
+                    <a href="incidents.php" class="btn btn-secondary">📋 Incidents</a>
+                    <a href="incidents.php?report=zone" class="btn btn-secondary">🏛️ Zone Reports</a>
+                    <a href="cctv-cameras.php" class="btn btn-secondary">📹 Cameras</a>
+                    <a href="alarm-systems.php" class="btn btn-secondary">🔔 Alarms</a>
+                    <a href="settings.php" class="btn btn-secondary">⚙️ System Settings</a>
+                </div>
+
+                <?php if ($message): ?>
+                    <div class="alert <?= $messageType ?>"><?= $message ?></div>
+                <?php endif; ?>
+
+                <!-- Warning banner -->
+                <div class="warning-banner">
+                    <strong>⚠️ Test Environment Notice</strong>
+                    All data created here is tagged with <b>[SIMULATED]</b> or <b>[SIM]</b> and can be safely cleared from the "Clear Simulated Data" button below. These simulations do not create real incidents and do not trigger real emergency responses.
+                </div>
+
+                <!-- Effective settings echo -->
+                <div class="settings-echo">
+                    <strong>🧾 Simulations will run with these settings:</strong>
+                    • AI pipeline: <strong><?= $setAiEnabled ? 'enabled' : '<span class="off">DISABLED</span>' ?></strong>
+                    • Confidence floor: <strong><?= (int)$setAiConfidenceMin ?>%</strong>
+                    • Auto-create alerts: <strong><?= $setAiAutoCreate ? 'ON' : 'OFF' ?></strong>
+                    • Auto-trigger alarms: <strong><?= $setAiAutoAlarm ? 'ON' : 'OFF' ?></strong>
+                    • Snapshots: <code><?= htmlspecialchars($setCctvSnapshotDir) ?></code>
+                    <br>
+                    <strong>🔔 Notifications:</strong>
+                    Incidents: <strong><?= $setNotifyIncident ? 'ON' : '<span class="off">OFF</span>' ?></strong>
+                    • AI alerts: <strong><?= $setNotifyAiAlert ? 'ON' : '<span class="off">OFF</span>' ?></strong>
+                    • Alarms: <strong><?= $setNotifyAlarm ? 'ON' : '<span class="off">OFF</span>' ?></strong>
+                    • Manpower: <strong><?= $setNotifyManpower ? 'ON' : '<span class="off">OFF</span>' ?></strong>
+                    <a href="settings.php" style="color:inherit;text-decoration:underline;">Change</a>
+                </div>
+
+                <!-- Stats -->
+                <div class="stats-grid">
+                    <div class="stat-card"><div class="icon purple">🎮</div><div class="info"><div class="number"><?= $stats['total_runs'] ?></div><div class="label">Total Runs</div></div></div>
+                    <div class="stat-card"><div class="icon red">🚨</div><div class="info"><div class="number"><?= $stats['sim_incidents'] ?></div><div class="label">Fake Incidents</div></div></div>
+                    <div class="stat-card"><div class="icon blue">🤖</div><div class="info"><div class="number"><?= $stats['sim_detections'] ?></div><div class="label">AI Detections</div></div></div>
+                    <div class="stat-card"><div class="icon orange">⚠️</div><div class="info"><div class="number"><?= $stats['sim_alerts'] ?></div><div class="label">AI Alerts</div></div></div>
+                    <div class="stat-card"><div class="icon red">🔔</div><div class="info"><div class="number"><?= $stats['sim_alarms'] ?></div><div class="label">Alarm Triggers</div></div></div>
+                    <div class="stat-card"><div class="icon teal">📱</div><div class="info"><div class="number"><?= $stats['sim_sms'] ?></div><div class="label">Test SMS</div></div></div>
+                </div>
+
+                <!-- SIMULATION RUNNER -->
+                <div class="section">
+                    <div class="section-header">
+                        <h2>▶️ Run a Simulation</h2>
+                    </div>
+
+                    <div>
+                        <label style="font-size:12px;color:#495057;font-weight:600;display:block;margin-bottom:6px;">
+                            Select Zone *
+                        </label>
+                        <select class="zone-selector" id="selectedZone">
+                            <option value="">— Choose a zone —</option>
+                            <?php foreach ($zones as $z): ?>
+                                <option value="<?= (int)$z['id'] ?>">
+                                    <?= htmlspecialchars($z['name']) ?>
+                                    (<?= htmlspecialchars(str_replace('_', ' ', $z['park_type'])) ?>)
+                                </option>
+                            <?php endforeach; ?>
+                        </select>
+                    </div>
+
+                    <div class="sim-grid">
+                        <?php
+                        $simTypes = [
+                            [
+                                'type'    => 'incident',
+                                'icon'    => '🚨',
+                                'title'   => 'Fake Incident',
+                                'desc'    => 'Creates a simulated incident report from a random scout/tourism user in the zone.',
+                                'blocked' => false,
+                                'note'    => $setNotifyIncident ? '' : 'Notifications will be suppressed (setting OFF).',
+                            ],
+                            [
+                                'type'    => 'ai_detection',
+                                'icon'    => '🤖',
+                                'title'   => 'Fake AI Detection',
+                                'desc'    => 'Simulates a camera AI detection. If threat, also creates an AI alert + notifies rangers.',
+                                'blocked' => !$setAiEnabled,
+                                'note'    => !$setAiEnabled
+                                                ? 'AI is globally disabled — this simulation is blocked.'
+                                                : (!$setAiAutoCreate ? 'Alert auto-create is OFF — detections only.' : ''),
+                            ],
+                            [
+                                'type'    => 'alarm',
+                                'icon'    => '🔔',
+                                'title'   => 'Fake Alarm',
+                                'desc'    => 'Triggers a simulated alarm in the zone and notifies rangers + supervisors.',
+                                'blocked' => false,
+                                'note'    => $setNotifyAlarm ? '' : 'Notifications will be suppressed (setting OFF).',
+                            ],
+                            [
+                                'type'    => 'ranger_movement',
+                                'icon'    => '🛤️',
+                                'title'   => 'Ranger Movement',
+                                'desc'    => 'Moves a random ranger to a new position and updates the live tracking + history.',
+                                'blocked' => false,
+                                'note'    => '',
+                            ],
+                            [
+                                'type'    => 'sms',
+                                'icon'    => '📱',
+                                'title'   => 'Test SMS',
+                                'desc'    => 'Logs a simulated SMS to a random phone number without using a real gateway.',
+                                'blocked' => false,
+                                'note'    => '',
+                            ],
+                        ];
+                        ?>
+
+                        <?php foreach ($simTypes as $st): ?>
+                            <div class="sim-card <?= $st['blocked'] ? 'blocked' : '' ?>">
+                                <div class="sim-icon"><?= $st['icon'] ?></div>
+                                <div class="sim-title"><?= htmlspecialchars($st['title']) ?></div>
+                                <div class="sim-desc"><?= htmlspecialchars($st['desc']) ?></div>
+                                <?php if (!empty($st['note'])): ?>
+                                    <div class="sim-note">ℹ️ <?= htmlspecialchars($st['note']) ?></div>
+                                <?php endif; ?>
+                                <form method="POST" style="width:100%;">
+                                    <input type="hidden" name="action" value="run">
+                                    <input type="hidden" name="simulation_type" value="<?= $st['type'] ?>">
+                                    <input type="hidden" name="zone_id" value="">
+                                    <button type="submit" class="sim-action"
+                                            <?= $st['blocked'] ? 'disabled' : '' ?>
+                                            onclick="return setZone(this, '<?= $st['type'] ?>')">
+                                        <?= $st['blocked'] ? '⛔ Blocked' : '▶ Run' ?>
+                                    </button>
+                                </form>
+                            </div>
+                        <?php endforeach; ?>
+                    </div>
+                </div>
+
+                <!-- CLEAR SIMULATED DATA -->
+                <div class="section" style="border-left:4px solid #dc3545;">
+                    <div class="section-header">
+                        <h2>🧹 Clear Simulated Data</h2>
+                    </div>
+                    <p style="font-size:13px;color:#6c757d;margin-bottom:14px;">
+                        Removes all records created by simulations (incidents, detections, alerts, alarm triggers, SMS).
+                        Only affects rows explicitly tagged as simulated.
+                    </p>
+                    <form method="POST" onsubmit="return confirm('Delete ALL simulated data? This cannot be undone.')">
+                        <input type="hidden" name="action" value="clear_simulated">
+                        <button type="submit" class="btn btn-danger">
+                            🧹 Clear All Simulated Data
+                        </button>
+                    </form>
+                </div>
+
+                <!-- HISTORY -->
+                <div class="section">
+                    <div class="section-header">
+                        <h2>📜 Simulation History (<?= count($history) ?>)</h2>
+                        <div class="header-actions">
+                            <form method="GET" style="display:inline;">
+                                <select name="hist_type" onchange="this.form.submit()"
+                                        style="padding:6px 10px;border:1px solid #e0e0e0;border-radius:6px;font-size:12px;">
+                                    <option value="">All types</option>
+                                    <?php foreach (['incident','ai_detection','alarm','sms','ranger_movement'] as $t): ?>
+                                        <option value="<?= $t ?>" <?= $filterHistType === $t ? 'selected' : '' ?>>
+                                            <?= $typeIcons[$t] ?? '' ?> <?= ucfirst(str_replace('_', ' ', $t)) ?>
+                                        </option>
+                                    <?php endforeach; ?>
+                                </select>
+                            </form>
+                            <?php if (count($history) > 0): ?>
+                                <form method="POST" style="display:inline;" onsubmit="return confirm('Clear all history entries? Data records will remain.')">
+                                    <input type="hidden" name="action" value="clear_history">
+                                    <button class="btn btn-secondary btn-sm">🧹 Clear History</button>
+                                </form>
+                            <?php endif; ?>
+                        </div>
+                    </div>
+
+                    <?php if (count($history) > 0): ?>
+                        <table class="history-table">
+                            <thead>
+                                <tr>
+                                    <th>Type</th>
+                                    <th>Name</th>
+                                    <th>Zone</th>
+                                    <th>Run By</th>
+                                    <th>Time</th>
+                                    <th>Actions</th>
+                                </tr>
+                            </thead>
+                            <tbody>
+                                <?php foreach ($history as $h): ?>
+                                    <?php
+                                    $icon = $typeIcons[$h['simulation_type']] ?? '🎮';
+                                    $params = is_string($h['parameters']) ? json_decode($h['parameters'], true) : $h['parameters'];
+                                    $params = is_array($params) ? $params : [];
+                                    ?>
+                                    <tr>
+                                        <td data-label="Type">
+                                            <span class="type-pill">
+                                                <?= $icon ?> <?= htmlspecialchars(str_replace('_', ' ', $h['simulation_type'])) ?>
+                                            </span>
+                                        </td>
+                                        <td data-label="Name">
+                                            <div style="font-weight:600;color:#0d3b22;font-size:13px;">
+                                                <?= htmlspecialchars($h['name']) ?>
+                                            </div>
+                                            <?php if ($h['description']): ?>
+                                                <div style="font-size:11px;color:#6c757d;margin-top:2px;">
+                                                    <?= htmlspecialchars(substr($h['description'], 0, 100)) ?>
+                                                    <?= strlen($h['description']) > 100 ? '…' : '' ?>
+                                                </div>
+                                            <?php endif; ?>
+                                        </td>
+                                        <td data-label="Zone">
+                                            <div style="font-size:12px;"><?= htmlspecialchars($h['zone_name'] ?? 'N/A') ?></div>
+                                        </td>
+                                        <td data-label="Run By">
+                                            <div style="font-size:12px;"><?= htmlspecialchars($h['created_by_name'] ?? 'System') ?></div>
+                                        </td>
+                                        <td data-label="Time">
+                                            <div style="font-size:12px;"><?= timeAgo($h['created_at']) ?></div>
+                                            <div style="font-size:11px;color:#adb5bd;">
+                                                <?= date('M j, Y H:i', strtotime($h['created_at'])) ?>
+                                            </div>
+                                        </td>
+                                        <td data-label="Actions">
+                                            <?php if (!empty($params['incident_id'])): ?>
+                                                <a href="incidents.php?id=<?= (int)$params['incident_id'] ?>"
+                                                   class="btn btn-secondary btn-sm" style="font-size:11px;padding:4px 8px;">📋 View</a>
+                                            <?php endif; ?>
+                                            <?php if (!empty($params['alert_id'])): ?>
+                                                <a href="ai-dashboard.php"
+                                                   class="btn btn-secondary btn-sm" style="font-size:11px;padding:4px 8px;">🤖 View</a>
+                                            <?php endif; ?>
+                                            <form method="POST" style="display:inline;" onsubmit="return confirm('Delete this history entry?')">
+                                                <input type="hidden" name="action" value="delete_history">
+                                                <input type="hidden" name="history_id" value="<?= (int)$h['id'] ?>">
+                                                <button class="btn btn-sm btn-danger">🗑️</button>
+                                            </form>
+                                        </td>
+                                    </tr>
+                                <?php endforeach; ?>
+                            </tbody>
+                        </table>
+                    <?php else: ?>
+                        <div class="empty-state">
+                            <span class="icon">🎮</span>
+                            <h3 style="font-size:16px;color:#495057;">No simulations run yet</h3>
+                            <p>Click one of the "Run" buttons above to test the system.</p>
+                        </div>
+                    <?php endif; ?>
+                </div>
+
+                <!-- Info notice -->
+                <div class="section" style="border-left:4px solid #cce5ff;background:#f8fbff;">
+                    <div style="font-size:13px;color:#495057;line-height:1.7;">
+                        <strong>ℹ️ About Simulations</strong><br>
+                        • All simulated records are tagged for easy identification and cleanup.<br>
+                        • Simulated incidents have <code>is_simulated = 1</code>.<br>
+                        • Simulated AI detections use a snapshot URL containing <code>SIM-</code>.<br>
+                        • Simulated alerts have titles starting with <code>[SIM]</code>.<br>
+                        • Real rangers and supervisors <b>will receive notifications</b> for simulated incidents so you can test the full alerting pipeline — unless the matching notification setting is off.<br>
+                        • AI simulations respect <code>ai_enabled</code>, <code>ai_confidence_min</code>, <code>ai_auto_create_alert</code>, and <code>ai_auto_trigger_alarm</code>.<br>
+                        • Broadcasts are sent via WebSocket so the live map updates in real time.
+                    </div>
+                </div>
+            </div>
+        </main>
+    </div>
+
+    <script src="../assets/js/app.js"></script>
+    <script src="../assets/js/transitions.js"></script>
+    <script>
+        function setZone(button, simType) {
+            const zoneId = document.getElementById('selectedZone').value;
+            if (!zoneId) {
+                alert('⚠️ Please select a zone first.');
+                return false;
+            }
+            const form = button.closest('form');
+            form.querySelector('input[name="zone_id"]').value = zoneId;
+
+            const labels = {
+                incident:        'fake incident',
+                ai_detection:    'fake AI detection',
+                alarm:           'fake alarm trigger',
+                ranger_movement: 'ranger movement',
+                sms:             'test SMS',
+            };
+            return confirm('▶️ Run a ' + (labels[simType] || simType) + '?');
+        }
+    </script>
+</body>
+</html>

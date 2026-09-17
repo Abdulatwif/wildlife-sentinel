@@ -1,0 +1,1255 @@
+<?php
+// ============================================================
+// supervisor/sms-gateway.php
+// Wildlife Sentinel — Zone Supervisor SMS Gateway
+// ------------------------------------------------------------
+// Provider support: MTN Zambia, Airtel Zambia, eSMS Africa (aggregator)
+// Routes by recipient prefix:
+//   096/076 → MTN Zambia
+//   097/077 → Airtel Zambia
+//   095/075 → Zamtel (via aggregator)
+//
+// Honors global settings:
+//   sms_enabled, notify_on_incident, notify_on_ai_alert,
+//   notify_on_alarm, notify_on_manpower, items_per_page
+// ============================================================
+
+error_reporting(E_ALL);
+ini_set('display_errors', '0');
+ini_set('log_errors', '1');
+
+require_once '../includes/functions.php';
+requireLogin();
+
+if (!function_exists('hasRole') || !hasRole('zone_supervisor')) {
+    header('Location: ../index.php');
+    exit();
+}
+
+$user = getCurrentUser();
+$pdo  = getDB();
+$activeZoneId = (int)($user['zone_id'] ?? 0);
+
+// ============================================================
+// GLOBAL SETTINGS (admin-enforced)
+// ============================================================
+if (!function_exists('ws_sms_global')) {
+    function ws_sms_global(string $key, $default = null) {
+        if (function_exists('getSetting')) {
+            $v = getSetting($key);
+            return $v !== null ? $v : $default;
+        }
+        try {
+            $stmt = getDB()->prepare("SELECT setting_value FROM settings WHERE setting_key = ? LIMIT 1");
+            $stmt->execute([$key]);
+            $row = $stmt->fetch();
+            return $row ? $row['setting_value'] : $default;
+        } catch (PDOException $e) {
+            return $default;
+        }
+    }
+}
+
+$globalSmsEnabled     = (string) ws_sms_global('sms_enabled', '1')            === '1';
+$globalNotifyIncident = (string) ws_sms_global('notify_on_incident', '1')     === '1';
+$globalNotifyAiAlert  = (string) ws_sms_global('notify_on_ai_alert', '1')     === '1';
+$globalNotifyAlarm    = (string) ws_sms_global('notify_on_alarm', '1')        === '1';
+$globalNotifyManpower = (string) ws_sms_global('notify_on_manpower', '1')     === '1';
+
+$itemsPerPage = (int) ws_sms_global('items_per_page', 25);
+if ($itemsPerPage < 5 || $itemsPerPage > 100) $itemsPerPage = 25;
+
+// ============================================================
+// SAFE HELPERS
+// ============================================================
+if (!function_exists('safeCount')) {
+    function safeCount(PDO $pdo, string $sql, array $params = []): int {
+        try { $stmt = $pdo->prepare($sql); $stmt->execute($params);
+            return (int)($stmt->fetch()['count'] ?? 0);
+        } catch (PDOException $e) { return 0; }
+    }
+}
+if (!function_exists('safeFetchAll')) {
+    function safeFetchAll(PDO $pdo, string $sql, array $params = []): array {
+        try { $stmt = $pdo->prepare($sql); $stmt->execute($params);
+            return $stmt->fetchAll();
+        } catch (PDOException $e) { return []; }
+    }
+}
+
+// ============================================================
+// ENSURE sms_messages TABLE EXISTS
+// ============================================================
+try {
+    $pdo->exec("
+        CREATE TABLE IF NOT EXISTS sms_messages (
+            id              INT AUTO_INCREMENT PRIMARY KEY,
+            zone_id         INT NOT NULL,
+            sender_id       INT NOT NULL,
+            recipient_id    INT NULL,
+            recipient_phone VARCHAR(20) NOT NULL,
+            recipient_name  VARCHAR(100) NULL,
+            message         TEXT NOT NULL,
+            template_key    VARCHAR(50) NULL,
+            status          ENUM('pending','sent','delivered','failed') DEFAULT 'pending',
+            provider        VARCHAR(50) NULL,
+            provider_ref    VARCHAR(120) NULL,
+            error_message   TEXT NULL,
+            segments        TINYINT DEFAULT 1,
+            sent_at         DATETIME NULL,
+            delivered_at    DATETIME NULL,
+            created_at      DATETIME DEFAULT CURRENT_TIMESTAMP,
+            INDEX idx_zone (zone_id),
+            INDEX idx_sender (sender_id),
+            INDEX idx_recipient (recipient_id),
+            INDEX idx_status (status),
+            INDEX idx_created (created_at)
+        ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
+    ");
+} catch (PDOException $e) { /* ignore */ }
+
+// ============================================================
+// CONFIG LOADER
+// ------------------------------------------------------------
+// Create `config.php` in the project root (one level above
+// this file's directory) with:
+//
+// <?php
+// return [
+//     // MTN Zambia
+//     'mtn_client_id'     => 'xxx',
+//     'mtn_client_secret' => 'xxx',
+//     'mtn_sender_id'     => 'WILDLIFE',
+//
+//     // Airtel Zambia (Airtel IQ SMS)
+//     'airtel_api_key'    => 'xxx',
+//     'airtel_customer_id'=> 'xxx',
+//     'airtel_sender_id'  => 'WILDLIFE',
+//     'airtel_template_id'=> 'xxx',   // may be required by Airtel
+//
+//     // eSMS Africa / aggregator (fallback + Zamtel)
+//     'esms_api_key'      => 'xxx',
+//     'esms_sender_id'    => 'WILDLIFE',
+// ];
+// ============================================================
+function ws_load_config(): array {
+    static $cfg = null;
+    if ($cfg !== null) return $cfg;
+    $path = __DIR__ . '/../config.php';
+    if (is_file($path)) {
+        $loaded = include $path;
+        $cfg = is_array($loaded) ? $loaded : [];
+    } else {
+        $cfg = [];
+    }
+    return $cfg;
+}
+
+// ============================================================
+// PREFIX → PROVIDER ROUTER
+// ============================================================
+function routeProviderByPhone(string $normalizedPhone): string {
+    if (strlen($normalizedPhone) < 3) return 'esms';
+    $prefix3 = substr($normalizedPhone, 0, 3);
+
+    if (in_array($prefix3, ['096', '076'], true)) return 'mtn';
+    if (in_array($prefix3, ['097', '077'], true)) return 'airtel';
+    if (in_array($prefix3, ['095', '075'], true)) return 'esms';
+    return 'esms';
+}
+
+// ============================================================
+// SMS PROVIDER ADAPTERS
+// ============================================================
+
+/** Send via MTN Zambia (SMS v3 API, OAuth2 client_credentials). */
+function sendViaMTN(string $to, string $message, array $cfg): array {
+    $clientId     = $cfg['mtn_client_id']     ?? '';
+    $clientSecret = $cfg['mtn_client_secret'] ?? '';
+    $senderId     = $cfg['mtn_sender_id']     ?? 'WILDLIFE';
+
+    if (!$clientId || !$clientSecret) {
+        return ['success'=>false,'ref'=>null,'error'=>'MTN credentials not configured','provider'=>'mtn'];
+    }
+
+    // --- 1. Get access token ---
+    $ch = curl_init('https://api.mtn.com/oauth/client_credential/accesstoken?grant_type=client_credentials');
+    curl_setopt_array($ch, [
+        CURLOPT_RETURNTRANSFER => true,
+        CURLOPT_POST           => true,
+        CURLOPT_POSTFIELDS     => http_build_query([
+            'client_id'     => $clientId,
+            'client_secret' => $clientSecret,
+        ]),
+        CURLOPT_TIMEOUT        => 15,
+    ]);
+    $response = curl_exec($ch);
+    $httpCode = curl_getinfo($ch, CURLINFO_HTTP_CODE);
+    $curlErr  = curl_error($ch);
+    curl_close($ch);
+
+    if ($curlErr) {
+        return ['success'=>false,'ref'=>null,'error'=>'MTN network: '.$curlErr,'provider'=>'mtn'];
+    }
+    if ($httpCode !== 200) {
+        return ['success'=>false,'ref'=>null,'error'=>'MTN auth failed (HTTP '.$httpCode.')','provider'=>'mtn'];
+    }
+    $data = json_decode($response, true);
+    $accessToken = $data['access_token'] ?? null;
+    if (!$accessToken) {
+        return ['success'=>false,'ref'=>null,'error'=>'MTN token missing in response','provider'=>'mtn'];
+    }
+
+    // --- 2. Send SMS ---
+    $msisdn = '+260' . ltrim($to, '0');
+    $payload = [
+        'outboundSMSMessageRequest' => [
+            'address'                 => ['tel:' . $msisdn],
+            'senderAddress'           => 'tel:' . $senderId,
+            'outboundSMSTextMessage'  => ['message' => $message],
+            'clientCorrelatorId'      => 'ws-' . bin2hex(random_bytes(6)),
+            'requestDeliveryReceipt'  => true,
+        ],
+    ];
+
+    $ch = curl_init('https://api.mtn.com/v3/sms/messages');
+    curl_setopt_array($ch, [
+        CURLOPT_RETURNTRANSFER => true,
+        CURLOPT_POST           => true,
+        CURLOPT_POSTFIELDS     => json_encode($payload),
+        CURLOPT_HTTPHEADER     => [
+            'Authorization: Bearer ' . $accessToken,
+            'Content-Type: application/json',
+            'Accept: application/json',
+        ],
+        CURLOPT_TIMEOUT        => 20,
+    ]);
+    $response = curl_exec($ch);
+    $httpCode = curl_getinfo($ch, CURLINFO_HTTP_CODE);
+    $curlErr  = curl_error($ch);
+    curl_close($ch);
+
+    if ($curlErr) {
+        return ['success'=>false,'ref'=>null,'error'=>'MTN network: '.$curlErr,'provider'=>'mtn'];
+    }
+    if ($httpCode >= 200 && $httpCode < 300) {
+        $res = json_decode($response, true);
+        $ref = $res['outboundSMSMessageRequest']['resourceReference']
+             ?? $res['resourceReference']
+             ?? ('MTN-' . bin2hex(random_bytes(4)));
+        return ['success'=>true,'ref'=>$ref,'error'=>null,'provider'=>'mtn'];
+    }
+    $err = json_decode($response, true);
+    $errMsg = $err['requestError']['serviceException']['text']
+            ?? $err['serviceException']['text']
+            ?? $err['message']
+            ?? ('HTTP '.$httpCode);
+    return ['success'=>false,'ref'=>null,'error'=>'MTN: '.$errMsg,'provider'=>'mtn'];
+}
+
+/** Send via Airtel Zambia (Airtel IQ SMS API). */
+function sendViaAirtel(string $to, string $message, array $cfg): array {
+    $apiKey     = $cfg['airtel_api_key']     ?? '';
+    $customerId = $cfg['airtel_customer_id'] ?? '';
+    $senderId   = $cfg['airtel_sender_id']   ?? 'WILDLIFE';
+    $templateId = $cfg['airtel_template_id'] ?? '';
+
+    if (!$apiKey || !$customerId) {
+        return ['success'=>false,'ref'=>null,'error'=>'Airtel credentials not configured','provider'=>'airtel'];
+    }
+
+    $msisdn = '260' . ltrim($to, '0');
+
+    $payload = [
+        'customerId' => $customerId,
+        'senderId'   => $senderId,
+        'message'    => $message,
+        'mobileNo'   => $msisdn,
+    ];
+    if ($templateId !== '') {
+        $payload['templateId'] = $templateId;
+    }
+
+    $ch = curl_init('https://iqsms.airtel.in/api/v1/send-sms');
+    curl_setopt_array($ch, [
+        CURLOPT_RETURNTRANSFER => true,
+        CURLOPT_POST           => true,
+        CURLOPT_POSTFIELDS     => json_encode($payload),
+        CURLOPT_HTTPHEADER     => [
+            'Authorization: Bearer ' . $apiKey,
+            'Content-Type: application/json',
+            'Accept: application/json',
+        ],
+        CURLOPT_TIMEOUT        => 20,
+    ]);
+    $response = curl_exec($ch);
+    $httpCode = curl_getinfo($ch, CURLINFO_HTTP_CODE);
+    $curlErr  = curl_error($ch);
+    curl_close($ch);
+
+    if ($curlErr) {
+        return ['success'=>false,'ref'=>null,'error'=>'Airtel network: '.$curlErr,'provider'=>'airtel'];
+    }
+    if ($httpCode >= 200 && $httpCode < 300) {
+        $res = json_decode($response, true);
+        $ref = $res['messageId'] ?? $res['requestId'] ?? ('AIR-' . bin2hex(random_bytes(4)));
+        return ['success'=>true,'ref'=>$ref,'error'=>null,'provider'=>'airtel'];
+    }
+    $err = json_decode($response, true);
+    $errMsg = $err['message'] ?? $err['error'] ?? ('HTTP '.$httpCode);
+    return ['success'=>false,'ref'=>null,'error'=>'Airtel: '.$errMsg,'provider'=>'airtel'];
+}
+
+/** Send via eSMS Africa aggregator (covers Zamtel + fallback for MTN/Airtel). */
+function sendViaESMS(string $to, string $message, array $cfg): array {
+    $apiKey   = $cfg['esms_api_key']   ?? '';
+    $senderId = $cfg['esms_sender_id'] ?? 'WILDLIFE';
+
+    if (!$apiKey) {
+        return ['success'=>false,'ref'=>null,'error'=>'eSMS credentials not configured','provider'=>'esms'];
+    }
+
+    $payload = [
+        'to'      => '260' . ltrim($to, '0'),
+        'from'    => $senderId,
+        'message' => $message,
+    ];
+
+    $ch = curl_init('https://api.esmsafrica.io/v1/sms/send');
+    curl_setopt_array($ch, [
+        CURLOPT_RETURNTRANSFER => true,
+        CURLOPT_POST           => true,
+        CURLOPT_POSTFIELDS     => json_encode($payload),
+        CURLOPT_HTTPHEADER     => [
+            'Authorization: Bearer ' . $apiKey,
+            'Content-Type: application/json',
+            'Accept: application/json',
+        ],
+        CURLOPT_TIMEOUT        => 20,
+    ]);
+    $response = curl_exec($ch);
+    $httpCode = curl_getinfo($ch, CURLINFO_HTTP_CODE);
+    $curlErr  = curl_error($ch);
+    curl_close($ch);
+
+    if ($curlErr) {
+        return ['success'=>false,'ref'=>null,'error'=>'eSMS network: '.$curlErr,'provider'=>'esms'];
+    }
+    if ($httpCode >= 200 && $httpCode < 300) {
+        $res = json_decode($response, true);
+        $ref = $res['messageId'] ?? $res['id'] ?? ('ESMS-' . bin2hex(random_bytes(4)));
+        return ['success'=>true,'ref'=>$ref,'error'=>null,'provider'=>'esms'];
+    }
+    $err = json_decode($response, true);
+    $errMsg = $err['message'] ?? $err['error'] ?? ('HTTP '.$httpCode);
+    return ['success'=>false,'ref'=>null,'error'=>'eSMS: '.$errMsg,'provider'=>'esms'];
+}
+
+// ============================================================
+// MAIN sendSMS() — routes to the correct network
+// ============================================================
+if (!function_exists('sendSMS')) {
+    function sendSMS(string $to, string $message): array {
+        $cfg = ws_load_config();
+
+        // Global gate — no SMS leaves the server when disabled
+        if ((string) ws_sms_global('sms_enabled', '1') !== '1') {
+            return ['success'=>false,'ref'=>null,'error'=>'SMS is globally disabled','provider'=>'disabled'];
+        }
+
+        $provider = routeProviderByPhone($to);
+
+        switch ($provider) {
+            case 'mtn':
+                $res = sendViaMTN($to, $message, $cfg);
+                break;
+            case 'airtel':
+                $res = sendViaAirtel($to, $message, $cfg);
+                break;
+            case 'esms':
+            default:
+                $res = sendViaESMS($to, $message, $cfg);
+                break;
+        }
+
+        // Automatic fallback: if the primary fails, try the aggregator once
+        if (!$res['success'] && $provider !== 'esms' && !empty($cfg['esms_api_key'])) {
+            $fb = sendViaESMS($to, $message, $cfg);
+            if ($fb['success']) {
+                $fb['provider'] = $fb['provider'] . ' (fallback)';
+                return $fb;
+            }
+        }
+
+        return $res;
+    }
+}
+
+/** Estimate GSM-7 segments. */
+if (!function_exists('estimateSegments')) {
+    function estimateSegments(string $message): int {
+        $len = mb_strlen($message);
+        if ($len <= 160) return 1;
+        return (int)ceil($len / 153);
+    }
+}
+
+/** Normalize Zambian phone to 09xxxxxxxx / 07xxxxxxxx. */
+if (!function_exists('normalizeZambianPhone')) {
+    function normalizeZambianPhone(?string $raw): ?string {
+        $raw = trim((string)$raw);
+        if ($raw === '') return null;
+        $digits = preg_replace('/[^0-9]/', '', $raw);
+        if (strpos($digits, '260') === 0) $digits = substr($digits, 3);
+        if (!preg_match('/^(09|07)[0-9]{8}$/', $digits)) return null;
+        return $digits;
+    }
+}
+
+/** Human-readable network name from prefix. */
+if (!function_exists('networkNameFromPhone')) {
+    function networkNameFromPhone(string $normalizedPhone): string {
+        $p = substr($normalizedPhone, 0, 3);
+        if (in_array($p, ['096','076'], true)) return 'MTN Zambia';
+        if (in_array($p, ['097','077'], true)) return 'Airtel Zambia';
+        if (in_array($p, ['095','075'], true)) return 'Zamtel';
+        return 'Unknown';
+    }
+}
+
+// ============================================================
+// RATE LIMITS
+// ============================================================
+if (!defined('SMS_RATE_PER_HOUR_PER_SUPERVISOR')) {
+    define('SMS_RATE_PER_HOUR_PER_SUPERVISOR', 50);
+}
+if (!defined('SMS_RATE_PER_DAY_PER_RECIPIENT')) {
+    define('SMS_RATE_PER_DAY_PER_RECIPIENT', 20);
+}
+
+if (!function_exists('withinRateLimit')) {
+    function withinRateLimit(PDO $pdo, int $senderId, string $recipientPhone): array {
+        $sentLastHour = safeCount($pdo, "
+            SELECT COUNT(*) as count FROM sms_messages
+            WHERE sender_id = ? AND created_at >= DATE_SUB(NOW(), INTERVAL 1 HOUR)
+        ", [$senderId]);
+        if ($sentLastHour >= SMS_RATE_PER_HOUR_PER_SUPERVISOR) {
+            return [false, 'Rate limit: max ' . SMS_RATE_PER_HOUR_PER_SUPERVISOR . ' SMS/hour.'];
+        }
+        $sentToRecipientToday = safeCount($pdo, "
+            SELECT COUNT(*) as count FROM sms_messages
+            WHERE recipient_phone = ? AND created_at >= DATE_SUB(NOW(), INTERVAL 1 DAY)
+        ", [$recipientPhone]);
+        if ($sentToRecipientToday >= SMS_RATE_PER_DAY_PER_RECIPIENT) {
+            return [false, 'Recipient already got ' . SMS_RATE_PER_DAY_PER_RECIPIENT . ' SMS in 24h.'];
+        }
+        return [true, ''];
+    }
+}
+
+// ============================================================
+// HANDLE POST ACTIONS
+// ============================================================
+$message = ''; $messageType = 'success';
+
+if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['action'])) {
+    $action = $_POST['action'];
+
+    // Global gate
+    if (in_array($action, ['send_sms', 'test_gateway'], true) && !$globalSmsEnabled) {
+        $message = '⛔ SMS is globally disabled by the administrator. Enable it in System Settings to send.';
+        $messageType = 'danger';
+    } else {
+
+        // ---- SEND SMS ----
+        if ($action === 'send_sms') {
+            $recipientMode = (string)($_POST['recipient_mode'] ?? 'single');
+            $recipientId   = (int)($_POST['recipient_id'] ?? 0);
+            $customPhone   = trim((string)($_POST['custom_phone'] ?? ''));
+            $body          = trim((string)($_POST['message'] ?? ''));
+            $templateKey   = trim((string)($_POST['template_key'] ?? '')) ?: null;
+
+            $errors = [];
+            if ($body === '')           $errors[] = 'Message body is required.';
+            if (mb_strlen($body) < 3)   $errors[] = 'Message must be at least 3 characters.';
+            if (mb_strlen($body) > 480) $errors[] = 'Message must not exceed 480 characters.';
+
+            $recipients = [];
+            if ($recipientMode === 'single') {
+                if (!$recipientId) $errors[] = 'Please select a recipient.';
+                else {
+                    $r = safeFetchAll($pdo, "
+                        SELECT id, full_name, phone, role FROM users
+                        WHERE id = ? AND zone_id = ? AND role IN ('ranger','scout','tourism') AND is_active = 1
+                    ", [$recipientId, $activeZoneId]);
+                    if (!$r) $errors[] = 'Recipient not found in your zone.';
+                    else $recipients[] = $r[0];
+                }
+            } elseif ($recipientMode === 'all_zone') {
+                $recipients = safeFetchAll($pdo, "
+                    SELECT id, full_name, phone, role FROM users
+                    WHERE zone_id = ? AND role IN ('ranger','scout','tourism') AND is_active = 1
+                    ORDER BY role, full_name
+                ", [$activeZoneId]);
+                if (empty($recipients)) $errors[] = 'No active users in your zone.';
+            } elseif ($recipientMode === 'custom') {
+                $norm = normalizeZambianPhone($customPhone);
+                if (!$norm) $errors[] = 'Custom phone must be a valid Zambian number.';
+                else $recipients[] = ['id'=>null,'full_name'=>'Custom number','phone'=>$norm,'role'=>'custom'];
+            } else {
+                $errors[] = 'Invalid recipient mode.';
+            }
+
+            if (empty($errors)) {
+                $sentCount = 0; $failedCount = 0; $skipped = 0;
+                $segments  = estimateSegments($body);
+                $lastError = null; $lastProvider = null;
+
+                foreach ($recipients as $r) {
+                    $phone = normalizeZambianPhone($r['phone'] ?? null);
+                    if (!$phone) { $skipped++; continue; }
+
+                    list($ok, $why) = withinRateLimit($pdo, (int)$user['id'], $phone);
+                    if (!$ok) { $skipped++; continue; }
+
+                    $res = sendSMS($phone, $body);
+                    $status = $res['success'] ? 'sent' : 'failed';
+                    if (!$res['success']) $lastError = $res['error'];
+                    $lastProvider = $res['provider'];
+
+                    try {
+                        $stmt = $pdo->prepare("
+                            INSERT INTO sms_messages
+                                (zone_id, sender_id, recipient_id, recipient_phone, recipient_name,
+                                 message, template_key, status, provider, provider_ref,
+                                 error_message, segments, sent_at, created_at)
+                            VALUES
+                                (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NOW(), NOW())
+                        ");
+                        $stmt->execute([
+                            $activeZoneId, $user['id'], $r['id'] ?? null,
+                            $phone, $r['full_name'] ?? null,
+                            $body, $templateKey, $status,
+                            $res['provider'], $res['ref'], $res['error'],
+                            $segments,
+                        ]);
+                    } catch (PDOException $e) { /* non-fatal */ }
+
+                    if ($res['success']) $sentCount++; else $failedCount++;
+                }
+
+                logAudit($user['id'], 'send_sms', [
+                    'mode' => $recipientMode, 'sent' => $sentCount,
+                    'failed' => $failedCount, 'skipped' => $skipped,
+                    'segments' => $segments, 'provider' => $lastProvider,
+                ]);
+
+                if ($sentCount > 0 && $failedCount === 0) {
+                    $message = "✅ SMS sent to {$sentCount} recipient" . ($sentCount === 1 ? '' : 's') . ".";
+                } elseif ($sentCount > 0 && $failedCount > 0) {
+                    $message = "⚠️ Sent: {$sentCount}, Failed: {$failedCount}.";
+                    if ($lastError) $message .= " Last error: " . htmlspecialchars($lastError);
+                    $messageType = 'warning';
+                } elseif ($skipped > 0 && $sentCount === 0 && $failedCount === 0) {
+                    $message = "⚠️ No SMS sent — {$skipped} skipped (rate limit / invalid).";
+                    $messageType = 'warning';
+                } else {
+                    $message = "❌ Failed to send. " . ($lastError ? htmlspecialchars($lastError) : '');
+                    $messageType = 'danger';
+                }
+            } else {
+                $message = implode('<br>', array_map('htmlspecialchars', $errors));
+                $messageType = 'danger';
+            }
+        }
+
+        // ---- TEST GATEWAY ----
+        if ($action === 'test_gateway') {
+            $testTo = normalizeZambianPhone($_POST['test_phone'] ?? ($user['phone'] ?? null));
+            if (!$testTo) {
+                $message = 'Enter a valid test number (e.g. 0971234567).';
+                $messageType = 'danger';
+            } else {
+                $network = networkNameFromPhone($testTo);
+                $body = 'Wildlife Sentinel test at ' . date('H:i:s') . '. Routed via ' . $network . '.';
+                $res  = sendSMS($testTo, $body);
+
+                try {
+                    $pdo->prepare("
+                        INSERT INTO sms_messages
+                            (zone_id, sender_id, recipient_id, recipient_phone, recipient_name,
+                             message, template_key, status, provider, provider_ref,
+                             error_message, segments, sent_at, created_at)
+                        VALUES (?, ?, NULL, ?, ?, ?, 'test', ?, ?, ?, ?, ?, NOW(), NOW())
+                    ")->execute([
+                        $activeZoneId, $user['id'], $testTo,
+                        'Test (' . $network . ')', $body,
+                        $res['success'] ? 'sent' : 'failed',
+                        $res['provider'], $res['ref'], $res['error'],
+                        estimateSegments($body),
+                    ]);
+                } catch (PDOException $e) {}
+
+                if ($res['success']) {
+                    $message = "✅ Test SMS sent to {$testTo} via {$network} (ref {$res['ref']}).";
+                } else {
+                    $message = "❌ Test failed ({$network}): " . htmlspecialchars($res['error'] ?: 'unknown');
+                    $messageType = 'danger';
+                }
+            }
+        }
+    }
+}
+
+// ============================================================
+// FETCH DATA
+// ============================================================
+$zoneUsers = safeFetchAll($pdo, "
+    SELECT id, full_name, phone, role, is_online
+    FROM users
+    WHERE zone_id = ? AND role IN ('ranger','scout','tourism') AND is_active = 1
+    ORDER BY role, full_name
+", [$activeZoneId]);
+
+$recentMessages = safeFetchAll($pdo, "
+    SELECT m.*, s.full_name AS sender_name
+    FROM sms_messages m
+    LEFT JOIN users s ON s.id = m.sender_id
+    WHERE m.zone_id = ?
+    ORDER BY m.id DESC
+    LIMIT " . (int)$itemsPerPage . "
+", [$activeZoneId]);
+
+$stats = [
+    'sent_today'   => safeCount($pdo, "SELECT COUNT(*) as count FROM sms_messages WHERE zone_id = ? AND status IN ('sent','delivered') AND created_at >= CURDATE()", [$activeZoneId]),
+    'failed_today' => safeCount($pdo, "SELECT COUNT(*) as count FROM sms_messages WHERE zone_id = ? AND status = 'failed' AND created_at >= CURDATE()", [$activeZoneId]),
+    'sent_week'    => safeCount($pdo, "SELECT COUNT(*) as count FROM sms_messages WHERE zone_id = ? AND status IN ('sent','delivered') AND created_at >= DATE_SUB(NOW(), INTERVAL 7 DAY)", [$activeZoneId]),
+    'recipients'   => count($zoneUsers),
+];
+
+// Weekly chart
+$weeklyCounts = [];
+$rows = safeFetchAll($pdo, "
+    SELECT DATE(created_at) AS d, COUNT(*) AS c
+    FROM sms_messages
+    WHERE zone_id = ? AND created_at >= DATE_SUB(CURDATE(), INTERVAL 6 DAY)
+    GROUP BY DATE(created_at)
+", [$activeZoneId]);
+$byDate = [];
+foreach ($rows as $row) { $byDate[$row['d']] = (int)$row['c']; }
+for ($i = 6; $i >= 0; $i--) {
+    $d = date('Y-m-d', strtotime("-$i day"));
+    $weeklyCounts[$d] = $byDate[$d] ?? 0;
+}
+$weeklyMax = max(1, max($weeklyCounts));
+
+// Templates
+$TEMPLATES = [
+    'incident_alert' => [
+        'label' => '🚨 Incident Alert',
+        'body'  => 'ALERT: A {CATEGORY} incident has been reported in your zone. Please check the Wildlife Sentinel dashboard for location and respond. — {ZONE} Supervisor',
+    ],
+    'patrol_reminder' => [
+        'label' => '🛤️ Patrol Reminder',
+        'body'  => 'Reminder: Patrol duty for {DATE}. Please confirm your availability and check your assigned route. — {ZONE} Supervisor',
+    ],
+    'weather_warning' => [
+        'label' => '🌧️ Weather Warning',
+        'body'  => 'Weather warning: heavy rains/flooding expected in {ZONE} over the next 24h. Stay safe, avoid low-lying areas. — Supervisor',
+    ],
+    'all_clear' => [
+        'label' => '✅ All Clear',
+        'body'  => 'All clear: the incident reported in {ZONE} has been resolved. Thank you for your quick response. — Supervisor',
+    ],
+    'manpower_request' => [
+        'label' => '🆘 Backup Request',
+        'body'  => 'BACKUP NEEDED: Additional rangers required at incident location. If available, respond to the dashboard for directions. — {ZONE} Supervisor',
+    ],
+    'meeting_notice' => [
+        'label' => '📅 Meeting Notice',
+        'body'  => 'Notice: All {ROLE} in {ZONE} are invited to a briefing on {DATE} at {TIME} at {PLACE}. Attendance required. — Supervisor',
+    ],
+];
+
+$zoneName = function_exists('getZoneName') ? (getZoneName($activeZoneId) ?: 'Your Zone') : 'Your Zone';
+
+// Provider status summary
+$cfg = ws_load_config();
+$providerStatus = [
+    'mtn'    => !empty($cfg['mtn_client_id']) && !empty($cfg['mtn_client_secret']),
+    'airtel' => !empty($cfg['airtel_api_key']) && !empty($cfg['airtel_customer_id']),
+    'esms'   => !empty($cfg['esms_api_key']),
+];
+$anyProvider = $providerStatus['mtn'] || $providerStatus['airtel'] || $providerStatus['esms'];
+?>
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+    <title>SMS Gateway - Supervisor - Wildlife Sentinel</title>
+    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css">
+    <link rel="stylesheet" href="../assets/css/style.css">
+    <link rel="stylesheet" href="../assets/css/transitions.css">
+    <style>
+        .dashboard-greeting { margin-bottom: 24px; }
+        .dashboard-greeting h1 { font-size: 28px; color: #0d3b22; }
+        .dashboard-greeting p  { color: #6c757d; font-size: 16px; }
+
+        .quick-nav { display: flex; gap: 8px; flex-wrap: wrap; margin-bottom: 16px; }
+        .quick-nav .btn { font-size: 12px; padding: 6px 12px; }
+
+        .stats-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(160px, 1fr)); gap: 14px; margin-bottom: 24px; }
+        .stat-card { background: white; border-radius: 12px; padding: 16px 18px; box-shadow: 0 2px 8px rgba(0,0,0,0.06); display: flex; align-items: center; gap: 12px; border: 1px solid #f0f0f0; transition: all 0.3s; }
+        .stat-card:hover { transform: translateY(-3px); box-shadow: 0 8px 25px rgba(0,0,0,0.1); }
+        .stat-card .icon { width: 44px; height: 44px; border-radius: 10px; display: flex; align-items: center; justify-content: center; font-size: 20px; flex-shrink: 0; }
+        .stat-card .icon.green  { background: #d4edda; color: #155724; }
+        .stat-card .icon.blue   { background: #cce5ff; color: #004085; }
+        .stat-card .icon.orange { background: #fff3cd; color: #856404; }
+        .stat-card .icon.red    { background: #f8d7da; color: #721c24; }
+        .stat-card .info .number { font-size: 22px; font-weight: 700; color: #0d3b22; }
+        .stat-card .info .label  { font-size: 11px; color: #6c757d; }
+
+        .section { background: white; border-radius: 14px; padding: 20px 22px; margin-bottom: 20px; box-shadow: 0 2px 12px rgba(0,0,0,0.06); border: 1px solid #f0f0f0; }
+        .section-header { display: flex; justify-content: space-between; align-items: center; margin-bottom: 14px; flex-wrap: wrap; gap: 10px; }
+        .section-header h2 { font-size: 17px; color: #0d3b22; display: flex; align-items: center; gap: 10px; }
+
+        .btn { padding: 9px 18px; border-radius: 8px; border: none; cursor: pointer; font-size: 13px; font-weight: 600; transition: all 0.2s; text-decoration: none; display: inline-flex; align-items: center; gap: 6px; }
+        .btn-primary { background: #1a5c3a; color: white; }
+        .btn-primary:hover { background: #0d3b22; }
+        .btn-primary:disabled { opacity: 0.5; cursor: not-allowed; }
+        .btn-secondary { background: #f0f0f0; color: #495057; }
+        .btn-secondary:hover { background: #e0e0e0; }
+        .btn-danger { background: #dc3545; color: white; }
+        .btn-success { background: #28a745; color: white; }
+        .btn-info { background: #17a2b8; color: white; }
+        .btn-sm { padding: 6px 12px; font-size: 11px; }
+        .btn-block { width: 100%; justify-content: center; }
+
+        .alert { padding: 12px 16px; border-radius: 10px; margin-bottom: 16px; font-size: 14px; line-height: 1.5; }
+        .alert.success { background: #d4edda; color: #155724; border: 1px solid #c3e6cb; }
+        .alert.danger  { background: #f8d7da; color: #721c24; border: 1px solid #f5c6cb; }
+        .alert.warning { background: #fff3cd; color: #856404; border: 1px solid #ffeeba; }
+
+        /* Global SMS state banner */
+        .state-banner {
+            display: flex; align-items: center; gap: 12px;
+            padding: 14px 18px; border-radius: 10px;
+            margin-bottom: 16px; font-size: 13px;
+        }
+        .state-banner.warn { background: #fff3cd; border: 1px solid #ffc107; color: #856404; }
+        .state-banner.info { background: #eef7f1; border: 1px solid #c3e6cb; color: #155724; }
+        .state-banner a { color: inherit; }
+        .state-banner code { font-size: 11.5px; background: rgba(255,255,255,.6); padding: 1px 6px; border-radius: 4px; }
+
+        /* Provider status grid */
+        .provider-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); gap: 12px; margin-bottom: 6px; }
+        .provider-card { padding: 14px 16px; border-radius: 10px; border: 1px solid #e0e0e0; background: #fcfcfc; }
+        .provider-card.ok  { border-left: 4px solid #28a745; background: #f0fff4; }
+        .provider-card.bad { border-left: 4px solid #dc3545; background: #fff5f5; }
+        .provider-card h4 { margin: 0 0 4px; font-size: 14px; color: #0d3b22; }
+        .provider-card p  { margin: 0; font-size: 11.5px; color: #6c757d; line-height: 1.45; }
+        .provider-card .badge { display: inline-block; padding: 1px 8px; border-radius: 10px; font-size: 10px; font-weight: 700; margin-left: 6px; }
+        .provider-card .badge.ok  { background: #d4edda; color: #155724; }
+        .provider-card .badge.bad { background: #f8d7da; color: #721c24; }
+
+        .compose-grid { display: grid; grid-template-columns: 1fr 320px; gap: 20px; }
+        @media (max-width: 900px) { .compose-grid { grid-template-columns: 1fr; } }
+
+        .form-group { margin-bottom: 14px; }
+        .form-group label { display: block; font-size: 12px; color: #495057; font-weight: 600; margin-bottom: 6px; }
+        .form-group input[type="text"], .form-group input[type="tel"],
+        .form-group select, .form-group textarea {
+            width: 100%; padding: 10px 14px; border: 1px solid #e0e0e0; border-radius: 8px;
+            font-size: 13px; background: #fafafa; transition: all 0.2s; font-family: inherit;
+        }
+        .form-group input:focus, .form-group select:focus, .form-group textarea:focus {
+            outline: none; border-color: #1a5c3a; background: white;
+        }
+        .form-group textarea { resize: vertical; min-height: 110px; }
+        .form-group input:disabled, .form-group select:disabled, .form-group textarea:disabled {
+            background: #f0f0f0; cursor: not-allowed;
+        }
+        .char-count { font-size: 11px; color: #6c757d; text-align: right; margin-top: 4px; }
+        .char-count.warn { color: #ffc107; font-weight: 600; }
+        .char-count.err  { color: #dc3545; font-weight: 600; }
+
+        .radio-row { display: flex; gap: 8px; flex-wrap: wrap; }
+        .radio-chip { display: inline-flex; align-items: center; gap: 6px; padding: 8px 14px; background: #f0f0f0; border-radius: 20px; font-size: 12px; font-weight: 600; color: #495057; cursor: pointer; transition: all 0.2s; border: 2px solid transparent; }
+        .radio-chip:hover { background: #e0e0e0; }
+        .radio-chip input { display: none; }
+        .radio-chip.active { background: #1a5c3a; color: white; }
+
+        .templates { display: flex; flex-direction: column; gap: 8px; }
+        .template-btn { text-align: left; padding: 10px 12px; border: 1px solid #e0e0e0; border-radius: 8px; background: #fafafa; font-size: 12px; cursor: pointer; transition: all 0.2s; }
+        .template-btn:hover { background: #f0f7f4; border-color: #1a5c3a; }
+        .template-btn .t-label { font-weight: 600; color: #0d3b22; display: block; margin-bottom: 3px; }
+        .template-btn .t-preview { color: #6c757d; font-size: 11px; line-height: 1.4; display: block; }
+
+        .preview-box { background: #e9f5ee; border-left: 4px solid #1a5c3a; padding: 12px 14px; border-radius: 8px; font-size: 12.5px; color: #0d3b22; margin-top: 12px; line-height: 1.55; min-height: 60px; white-space: pre-wrap; word-break: break-word; }
+        .preview-box .preview-meta { font-size: 10px; color: #6c757d; margin-bottom: 6px; text-transform: uppercase; letter-spacing: 0.5px; }
+        .preview-box .network-note { font-size: 11px; color: #17a2b8; margin-top: 6px; }
+
+        .sms-list { display: flex; flex-direction: column; gap: 8px; max-height: 520px; overflow-y: auto; }
+        .sms-item { display: grid; grid-template-columns: 34px 1fr auto; gap: 12px; align-items: flex-start; padding: 12px 14px; border: 1px solid #f0f0f0; border-radius: 10px; background: #fcfcfc; transition: all 0.2s; }
+        .sms-item:hover { background: #f8faf9; border-color: #d0e5da; }
+        .sms-item .si-icon { width: 34px; height: 34px; border-radius: 50%; display: flex; align-items: center; justify-content: center; font-size: 15px; background: #d4edda; color: #155724; flex-shrink: 0; }
+        .sms-item.status-failed .si-icon { background: #f8d7da; color: #721c24; }
+        .sms-item.status-pending .si-icon { background: #fff3cd; color: #856404; }
+        .sms-item .si-body { min-width: 0; }
+        .sms-item .si-header { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; font-size: 12.5px; }
+        .sms-item .si-header .to { font-weight: 600; color: #0d3b22; }
+        .sms-item .si-header .role-pill { padding: 1px 8px; font-size: 9px; border-radius: 10px; text-transform: uppercase; font-weight: 700; background: #e9ecef; color: #495057; }
+        .sms-item .si-header .status-pill { padding: 1px 8px; font-size: 9px; border-radius: 10px; text-transform: uppercase; font-weight: 700; }
+        .si-header .status-pill.sent      { background: #d4edda; color: #155724; }
+        .si-header .status-pill.delivered { background: #cce5ff; color: #004085; }
+        .si-header .status-pill.failed    { background: #f8d7da; color: #721c24; }
+        .si-header .status-pill.pending   { background: #fff3cd; color: #856404; }
+        .sms-item .si-text { font-size: 12px; color: #495057; margin-top: 4px; line-height: 1.5; word-break: break-word; }
+        .sms-item .si-meta { font-size: 10.5px; color: #adb5bd; margin-top: 4px; }
+        .si-provider-pill { display: inline-block; padding: 1px 8px; font-size: 9px; border-radius: 10px; text-transform: uppercase; font-weight: 700; background: #e8f4f8; color: #0c5460; }
+
+        .weekly-chart { display: grid; grid-template-columns: repeat(7, 1fr); gap: 6px; align-items: end; height: 90px; margin-top: 8px; }
+        .weekly-bar { display: flex; flex-direction: column; align-items: center; gap: 4px; }
+        .weekly-bar .bar { width: 100%; background: linear-gradient(180deg, #1a5c3a, #2d8a4e); border-radius: 4px 4px 0 0; min-height: 4px; transition: height 0.3s; }
+        .weekly-bar .bar-label { font-size: 9px; color: #6c757d; text-transform: uppercase; }
+        .weekly-bar .bar-count { font-size: 10px; font-weight: 700; color: #0d3b22; }
+
+        .empty-state { text-align:center; padding:40px 20px; color:#6c757d; }
+        .empty-state .icon { font-size: 48px; display: block; margin-bottom: 10px; opacity: 0.4; }
+
+        @media (max-width: 768px) {
+            .stats-grid { grid-template-columns: 1fr 1fr; gap: 10px; }
+            .dashboard-greeting h1 { font-size: 22px; }
+            .sms-item { grid-template-columns: 28px 1fr; }
+            .sms-item .si-time { grid-column: 1 / -1; }
+        }
+    </style>
+</head>
+<body>
+<div class="app-container">
+    <?php include '../includes/sidebar.php'; ?>
+
+    <main class="main-content">
+        <header class="top-header">
+            <button class="menu-toggle" onclick="toggleSidebar()">☰</button>
+            <h1>SMS Gateway</h1>
+            <div class="header-right">
+                <span class="online-status">● Online</span>
+                <span class="data-honesty-badge">🟢 Live Data</span>
+                <span class="user-name"><?= htmlspecialchars($user['full_name']) ?></span>
+            </div>
+        </header>
+
+        <div class="content">
+            <div class="dashboard-greeting">
+                <h1>📱 SMS Gateway</h1>
+                <p>Send SMS alerts to rangers, scouts, and tourism operators in <strong><?= htmlspecialchars($zoneName) ?></strong>. Messages route automatically: MTN (096/076), Airtel (097/077), Zamtel (095/075).</p>
+            </div>
+
+            <div class="quick-nav">
+                <a href="dashboard.php" class="btn btn-secondary">🏠 Dashboard</a>
+                <a href="incidents.php" class="btn btn-secondary">📋 Incidents</a>
+                <a href="ai-dashboard.php" class="btn btn-secondary">🤖 AI Dashboard</a>
+                <a href="alarm-systems.php" class="btn btn-secondary">🔔 Alarms</a>
+                <a href="zone-settings.php" class="btn btn-secondary">⚙️ Zone Settings</a>
+            </div>
+
+            <?php if (!$globalSmsEnabled): ?>
+                <div class="state-banner warn">
+                    <span style="font-size:20px;">⛔</span>
+                    <div>
+                        <strong>SMS is globally disabled by the administrator.</strong>
+                        Manual sends (compose + test) are blocked. Automated notifications
+                        (incidents, AI alerts, alarms, manpower) are also suppressed.
+                        <a href="zone-settings.php" style="color:inherit;text-decoration:underline;">View settings</a>.
+                    </div>
+                </div>
+            <?php elseif (!$anyProvider): ?>
+                <div class="state-banner warn">
+                    <span style="font-size:20px;">⚠️</span>
+                    <div>
+                        <strong>No SMS provider is configured.</strong>
+                        Ask your administrator to add credentials to <code>config.php</code> at the project root.
+                    </div>
+                </div>
+            <?php else: ?>
+                <div class="state-banner info">
+                    <span style="font-size:18px;">✅</span>
+                    <div>
+                        <strong>SMS is enabled.</strong>
+                        Notifications routing: Incidents <strong><?= $globalNotifyIncident ? 'ON' : 'OFF' ?></strong>
+                        • AI alerts <strong><?= $globalNotifyAiAlert ? 'ON' : 'OFF' ?></strong>
+                        • Alarms <strong><?= $globalNotifyAlarm ? 'ON' : 'OFF' ?></strong>
+                        • Manpower <strong><?= $globalNotifyManpower ? 'ON' : 'OFF' ?></strong>.
+                        Manual sends below are always allowed.
+                    </div>
+                </div>
+            <?php endif; ?>
+
+            <?php if ($message): ?>
+                <div class="alert <?= htmlspecialchars($messageType) ?>"><?= $message ?></div>
+            <?php endif; ?>
+
+            <!-- Provider status -->
+            <div class="section">
+                <div class="section-header">
+                    <h2>📡 Provider Status</h2>
+                    <button type="button" class="btn btn-info btn-sm" onclick="document.getElementById('testGatewayBox').style.display = document.getElementById('testGatewayBox').style.display === 'none' ? 'block' : 'none'">
+                        🔌 Test connection
+                    </button>
+                </div>
+                <div class="provider-grid">
+                    <div class="provider-card <?= $providerStatus['mtn'] ? 'ok' : 'bad' ?>">
+                        <h4>🟡 MTN Zambia <span class="badge <?= $providerStatus['mtn'] ? 'ok' : 'bad' ?>"><?= $providerStatus['mtn'] ? 'Configured' : 'Not set' ?></span></h4>
+                        <p>Handles numbers starting with <b>096</b> or <b>076</b>. OAuth2 client-credentials + SMS v3 API.</p>
+                    </div>
+                    <div class="provider-card <?= $providerStatus['airtel'] ? 'ok' : 'bad' ?>">
+                        <h4>🔴 Airtel Zambia <span class="badge <?= $providerStatus['airtel'] ? 'ok' : 'bad' ?>"><?= $providerStatus['airtel'] ? 'Configured' : 'Not set' ?></span></h4>
+                        <p>Handles numbers starting with <b>097</b> or <b>077</b>. Airtel IQ SMS API.</p>
+                    </div>
+                    <div class="provider-card <?= $providerStatus['esms'] ? 'ok' : 'bad' ?>">
+                        <h4>⚪ Aggregator (eSMS) <span class="badge <?= $providerStatus['esms'] ? 'ok' : 'bad' ?>"><?= $providerStatus['esms'] ? 'Configured' : 'Not set' ?></span></h4>
+                        <p>Handles Zamtel (<b>095</b>/<b>075</b>) and acts as fallback if a direct route fails.</p>
+                    </div>
+                </div>
+            </div>
+
+            <div id="testGatewayBox" style="display:none;margin-bottom:20px;" class="section">
+                <form method="POST" style="display:flex;gap:10px;align-items:flex-end;flex-wrap:wrap;">
+                    <input type="hidden" name="action" value="test_gateway">
+                    <div class="form-group" style="flex:1;min-width:220px;margin:0;">
+                        <label for="test_phone">Send a test SMS to</label>
+                        <input type="tel" name="test_phone" id="test_phone" placeholder="0971234567" value="<?= htmlspecialchars($user['phone'] ?? '') ?>" <?= !$globalSmsEnabled ? 'disabled' : '' ?>>
+                    </div>
+                    <button type="submit" class="btn btn-info" <?= !$globalSmsEnabled ? 'disabled' : '' ?>>🔌 Send test</button>
+                </form>
+            </div>
+
+            <!-- Stats -->
+            <div class="stats-grid">
+                <div class="stat-card"><div class="icon green">📤</div><div class="info"><div class="number"><?= (int)$stats['sent_today'] ?></div><div class="label">Sent Today</div></div></div>
+                <div class="stat-card"><div class="icon blue">📅</div><div class="info"><div class="number"><?= (int)$stats['sent_week'] ?></div><div class="label">Sent (7 days)</div></div></div>
+                <div class="stat-card"><div class="icon red">❌</div><div class="info"><div class="number"><?= (int)$stats['failed_today'] ?></div><div class="label">Failed Today</div></div></div>
+                <div class="stat-card"><div class="icon orange">👥</div><div class="info"><div class="number"><?= (int)$stats['recipients'] ?></div><div class="label">Active Recipients</div></div></div>
+            </div>
+
+            <!-- Compose + Templates -->
+            <div class="compose-grid">
+                <div class="section">
+                    <div class="section-header">
+                        <h2>✉️ Compose SMS</h2>
+                    </div>
+
+                    <form method="POST" id="smsForm" novalidate>
+                        <input type="hidden" name="action" value="send_sms">
+                        <input type="hidden" name="template_key" id="templateKey" value="">
+
+                        <div class="form-group">
+                            <label>Recipients</label>
+                            <div class="radio-row">
+                                <label class="radio-chip active" data-mode="single">
+                                    <input type="radio" name="recipient_mode" value="single" checked> 👤 One user
+                                </label>
+                                <label class="radio-chip" data-mode="all_zone">
+                                    <input type="radio" name="recipient_mode" value="all_zone"> 📢 All in zone (<?= count($zoneUsers) ?>)
+                                </label>
+                                <label class="radio-chip" data-mode="custom">
+                                    <input type="radio" name="recipient_mode" value="custom"> 📞 Custom number
+                                </label>
+                            </div>
+                        </div>
+
+                        <div class="form-group" id="singleRecipientGroup">
+                            <label for="recipient_id">Select user</label>
+                            <select name="recipient_id" id="recipient_id" <?= !$globalSmsEnabled ? 'disabled' : '' ?>>
+                                <option value="">— Choose a user —</option>
+                                <?php foreach ($zoneUsers as $u): ?>
+                                    <option value="<?= (int)$u['id'] ?>" data-phone="<?= htmlspecialchars($u['phone'] ?? '') ?>">
+                                        <?= htmlspecialchars($u['full_name']) ?>
+                                        (<?= htmlspecialchars($u['role']) ?>)
+                                        <?= $u['phone'] ? '— ' . htmlspecialchars($u['phone']) : '— no phone' ?>
+                                    </option>
+                                <?php endforeach; ?>
+                            </select>
+                            <div class="char-count" id="recipientHint"></div>
+                        </div>
+
+                        <div class="form-group" id="customRecipientGroup" style="display:none;">
+                            <label for="custom_phone">Custom phone number</label>
+                            <input type="tel" name="custom_phone" id="custom_phone" placeholder="0971234567 or +260971234567" <?= !$globalSmsEnabled ? 'disabled' : '' ?>>
+                            <div class="char-count" id="customNetworkHint">Must be a Zambian mobile (09/07 prefix).</div>
+                        </div>
+
+                        <div class="form-group">
+                            <label for="messageBody">Message</label>
+                            <textarea name="message" id="messageBody" maxlength="480"
+                                placeholder="Type your SMS here…" <?= !$globalSmsEnabled ? 'disabled' : '' ?>></textarea>
+                            <div class="char-count" id="charCount">0 / 480 characters</div>
+                        </div>
+
+                        <div class="preview-box" id="previewBox">
+                            <div class="preview-meta">Preview</div>
+                            <div id="previewText">Your message will appear here.</div>
+                            <div class="network-note" id="networkNote"></div>
+                        </div>
+
+                        <button type="submit" class="btn btn-primary btn-block" id="sendBtn" style="margin-top:14px;" <?= !$globalSmsEnabled ? 'disabled' : '' ?>>
+                            📤 Send SMS
+                        </button>
+                    </form>
+                </div>
+
+                <div class="section">
+                    <div class="section-header">
+                        <h2>⚡ Templates</h2>
+                    </div>
+                    <div class="templates">
+                        <?php foreach ($TEMPLATES as $key => $tpl): ?>
+                            <button type="button" class="template-btn" data-body="<?= htmlspecialchars($tpl['body'], ENT_QUOTES) ?>" data-key="<?= htmlspecialchars($key) ?>">
+                                <span class="t-label"><?= htmlspecialchars($tpl['label']) ?></span>
+                                <span class="t-preview"><?= htmlspecialchars(mb_substr($tpl['body'], 0, 90)) ?>…</span>
+                            </button>
+                        <?php endforeach; ?>
+                    </div>
+
+                    <div style="margin-top:16px;font-size:12px;color:#6c757d;line-height:1.55;">
+                        <strong>Tips:</strong><br>
+                        • Keep messages under 160 characters for a single SMS.<br>
+                        • Replace placeholders like <code>{ZONE}</code>, <code>{DATE}</code> yourself before sending.<br>
+                        • Rate limit: 50 SMS/hour per supervisor, 20/day per recipient.<br>
+                        • MTN/Airtel routes attempt a fallback to the aggregator on failure.
+                    </div>
+                </div>
+            </div>
+
+            <!-- Weekly activity -->
+            <div class="section">
+                <div class="section-header">
+                    <h2>📊 Activity (last 7 days)</h2>
+                </div>
+                <div class="weekly-chart">
+                    <?php foreach ($weeklyCounts as $d => $c): ?>
+                        <div class="weekly-bar" title="<?= htmlspecialchars($d) ?>: <?= (int)$c ?> messages">
+                            <span class="bar-count"><?= (int)$c ?></span>
+                            <div class="bar" style="height: <?= max(4, (int)(($c / $weeklyMax) * 70)) ?>px;"></div>
+                            <span class="bar-label"><?= date('D', strtotime($d)) ?></span>
+                        </div>
+                    <?php endforeach; ?>
+                </div>
+            </div>
+
+            <!-- Outbox -->
+            <div class="section">
+                <div class="section-header">
+                    <h2>📨 Recent Outbox</h2>
+                    <span style="font-size:12px;color:#6c757d;">Last <?= count($recentMessages) ?> messages from this zone</span>
+                </div>
+
+                <?php if (count($recentMessages) === 0): ?>
+                    <div class="empty-state">
+                        <span class="icon">📭</span>
+                        <h3>No messages sent yet</h3>
+                        <p>Use the compose form above to send your first SMS.</p>
+                    </div>
+                <?php else: ?>
+                    <div class="sms-list">
+                        <?php foreach ($recentMessages as $m): ?>
+                            <?php
+                                $statusClass = 'status-' . ($m['status'] ?? 'pending');
+                                $statusIcon  = [
+                                    'sent' => '📤', 'delivered' => '✅',
+                                    'failed' => '❌', 'pending' => '⏳',
+                                ][$m['status']] ?? '📨';
+                            ?>
+                            <div class="sms-item <?= $statusClass ?>">
+                                <div class="si-icon"><?= $statusIcon ?></div>
+                                <div class="si-body">
+                                    <div class="si-header">
+                                        <span class="to">👤 <?= htmlspecialchars($m['recipient_name'] ?? $m['recipient_phone']) ?></span>
+                                        <span class="status-pill <?= htmlspecialchars($m['status']) ?>"><?= htmlspecialchars($m['status']) ?></span>
+                                        <?php if ($m['provider']): ?>
+                                            <span class="si-provider-pill"><?= htmlspecialchars($m['provider']) ?></span>
+                                        <?php endif; ?>
+                                        <?php if ($m['segments'] > 1): ?>
+                                            <span class="role-pill"><?= (int)$m['segments'] ?> segments</span>
+                                        <?php endif; ?>
+                                    </div>
+                                    <div class="si-text"><?= htmlspecialchars(mb_substr($m['message'], 0, 160)) ?><?= mb_strlen($m['message']) > 160 ? '…' : '' ?></div>
+                                    <div class="si-meta">
+                                        📞 <?= htmlspecialchars($m['recipient_phone']) ?>
+                                        • By <?= htmlspecialchars($m['sender_name'] ?? 'Unknown') ?>
+                                        • <?= timeAgo($m['created_at']) ?>
+                                        <?php if ($m['error_message']): ?>
+                                            • <span style="color:#dc3545;">⚠️ <?= htmlspecialchars(mb_substr($m['error_message'], 0, 80)) ?></span>
+                                        <?php endif; ?>
+                                    </div>
+                                </div>
+                                <div class="si-time" style="font-size:11px;color:#adb5bd;text-align:right;white-space:nowrap;">
+                                    <?= date('d M H:i', strtotime($m['created_at'])) ?>
+                                </div>
+                            </div>
+                        <?php endforeach; ?>
+                    </div>
+                <?php endif; ?>
+            </div>
+
+            <div class="section" style="border-left:4px solid #cce5ff;background:#f8fbff;">
+                <div style="font-size:13px;color:#495057;line-height:1.7;">
+                    <strong>ℹ️ How routing works</strong><br>
+                    • The recipient's phone prefix chooses the network: <b>096/076 → MTN</b>, <b>097/077 → Airtel</b>, <b>095/075 → Zamtel</b> (via aggregator).<br>
+                    • If a direct MTN/Airtel send fails, the message is automatically retried through the aggregator (when configured).<br>
+                    • Every message is stored in <code>sms_messages</code> with the provider name, provider reference, error text and segment count.<br>
+                    • Credentials live in <code>config.php</code> (project root) — never in this file.<br>
+                    • Automated notifications respect the global <code>sms_enabled</code> and <code>notify_on_*</code> settings.
+                </div>
+            </div>
+        </div>
+    </main>
+</div>
+
+<script src="../assets/js/app.js"></script>
+<script src="../assets/js/transitions.js"></script>
+<script>
+    // ============================================================
+    // RECIPIENT MODE TOGGLE
+    // ============================================================
+    const modeChips = document.querySelectorAll('.radio-chip[data-mode]');
+    const singleGroup = document.getElementById('singleRecipientGroup');
+    const customGroup = document.getElementById('customRecipientGroup');
+
+    modeChips.forEach(chip => {
+        chip.addEventListener('click', () => {
+            modeChips.forEach(c => c.classList.remove('active'));
+            chip.classList.add('active');
+            const mode = chip.dataset.mode;
+            chip.querySelector('input').checked = true;
+
+            if (mode === 'single')      { singleGroup.style.display = 'block'; customGroup.style.display = 'none'; }
+            else if (mode === 'custom') { singleGroup.style.display = 'none';  customGroup.style.display = 'block'; document.getElementById('custom_phone').focus(); }
+            else                        { singleGroup.style.display = 'none';  customGroup.style.display = 'none'; }
+
+            updateNetworkNote();
+        });
+    });
+
+    // ============================================================
+    // PHONE → NETWORK HINT
+    // ============================================================
+    const recipientSelect = document.getElementById('recipient_id');
+    const recipientHint   = document.getElementById('recipientHint');
+    const networkNote     = document.getElementById('networkNote');
+
+    function detectNetwork(phone) {
+        if (!phone) return null;
+        let n = phone.replace(/[^0-9]/g, '');
+        if (n.indexOf('260') === 0) n = n.substring(3);
+        if (!/^(09|07)[0-9]{8}$/.test(n)) return null;
+        const p = n.substring(0, 3);
+        if (p === '096' || p === '076') return 'MTN Zambia';
+        if (p === '097' || p === '077') return 'Airtel Zambia';
+        if (p === '095' || p === '075') return 'Zamtel';
+        return 'Unknown';
+    }
+
+    function updateRecipientHint() {
+        const opt = recipientSelect.options[recipientSelect.selectedIndex];
+        if (!opt || !opt.value) { recipientHint.textContent = ''; return; }
+        const phone = opt.dataset.phone || '';
+        if (!phone) {
+            recipientHint.textContent = '⚠️ This user has no phone number on file.';
+            recipientHint.className = 'char-count err';
+        } else {
+            const net = detectNetwork(phone);
+            recipientHint.textContent = 'Will send to: ' + phone + (net ? ' (' + net + ')' : '');
+            recipientHint.className = 'char-count';
+        }
+    }
+    recipientSelect.addEventListener('change', updateRecipientHint);
+
+    const customPhone = document.getElementById('custom_phone');
+    customPhone.addEventListener('input', updateNetworkNote);
+
+    function updateNetworkNote() {
+        const mode = document.querySelector('input[name="recipient_mode"]:checked').value;
+        let phone = '';
+        if (mode === 'single') {
+            const opt = recipientSelect.options[recipientSelect.selectedIndex];
+            phone = opt ? (opt.dataset.phone || '') : '';
+        } else if (mode === 'custom') {
+            phone = customPhone.value || '';
+        } else if (mode === 'all_zone') {
+            networkNote.textContent = '📢 Message will be routed per-recipient based on each user\'s prefix.';
+            return;
+        }
+        const net = detectNetwork(phone);
+        networkNote.textContent = net ? '📡 Routing via ' + net : '';
+    }
+
+    // ============================================================
+    // CHARACTER COUNT + PREVIEW
+    // ============================================================
+    const messageBody = document.getElementById('messageBody');
+    const charCount   = document.getElementById('charCount');
+    const previewText = document.getElementById('previewText');
+
+    function refreshCompose() {
+        const len = messageBody.value.length;
+        charCount.textContent = len + ' / 480 characters';
+        charCount.className = 'char-count';
+        if (len > 480) charCount.classList.add('err');
+        else if (len > 320) charCount.classList.add('warn');
+        previewText.textContent = messageBody.value.trim() || 'Your message will appear here.';
+    }
+    messageBody.addEventListener('input', refreshCompose);
+    refreshCompose();
+
+    // ============================================================
+    // TEMPLATE QUICK-FILL
+    // ============================================================
+    document.querySelectorAll('.template-btn').forEach(btn => {
+        btn.addEventListener('click', () => {
+            const body = btn.dataset.body || '';
+            const key  = btn.dataset.key || '';
+            const zoneName = <?= json_encode($zoneName, JSON_HEX_APOS | JSON_HEX_QUOT | JSON_HEX_TAG | JSON_HEX_AMP) ?>;
+            const filled = body.replace(/\{ZONE\}/g, zoneName);
+            messageBody.value = filled;
+            document.getElementById('templateKey').value = key;
+            refreshCompose();
+            messageBody.focus();
+            messageBody.scrollIntoView({ behavior: 'smooth', block: 'center' });
+        });
+    });
+
+    // ============================================================
+    // SUBMIT GUARD
+    // ============================================================
+    document.getElementById('smsForm').addEventListener('submit', (e) => {
+        const body = messageBody.value.trim();
+        if (body.length < 3) {
+            e.preventDefault(); alert('Please type a message (at least 3 characters).'); messageBody.focus(); return false;
+        }
+        const mode = document.querySelector('input[name="recipient_mode"]:checked').value;
+        if (mode === 'single' && !recipientSelect.value) {
+            e.preventDefault(); alert('Please select a recipient.'); recipientSelect.focus(); return false;
+        }
+        if (mode === 'custom') {
+            const cp = customPhone.value.trim();
+            if (!cp) { e.preventDefault(); alert('Please enter a custom phone number.'); customPhone.focus(); return false; }
+        }
+        if (mode === 'all_zone') {
+            const count = <?= count($zoneUsers) ?>;
+            if (!confirm('Send this SMS to all ' + count + ' active users in your zone?')) { e.preventDefault(); return false; }
+        }
+        const btn = document.getElementById('sendBtn');
+        btn.disabled = true;
+        btn.textContent = '⏳ Sending…';
+    });
+
+    // Initial network hint
+    updateNetworkNote();
+
+    console.log('✅ SMS Gateway loaded');
+</script>
+</body>
+</html>

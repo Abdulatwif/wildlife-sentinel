@@ -1,0 +1,19 @@
+# OS
+Thumbs.db
+.DS_Store
+desktop.ini
+
+# PHP / IDE
+*.log
+.vscode/
+.idea/
+*.suo
+
+# Uploaded media (user-generated, app-specific)
+uploads/*
+!uploads/.gitkeep
+
+# Local config / secrets
+config/ca.pem
+*.env
+.env.*

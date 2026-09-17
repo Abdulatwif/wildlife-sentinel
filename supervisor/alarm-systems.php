@@ -1,0 +1,1168 @@
+<?php
+// ============================================================
+// supervisor/alarm-systems.php
+// Zone Supervisor — Real Alarm Systems (zone-scoped)
+// ------------------------------------------------------------
+// Features:
+//   - Add / edit / delete alarms with REAL sound URLs
+//   - Manually sound / stop alarms (play siren in browser)
+//   - Auto-trigger when an incident is unacknowledged for X sec
+//   - View active triggers + trigger history
+//   - Honors global settings (ai_enabled, notify_on_alarm)
+// ============================================================
+
+error_reporting(E_ALL);
+ini_set('display_errors', '0');
+ini_set('log_errors', '1');
+
+require_once __DIR__ . '/../includes/functions.php';
+requireLogin();
+
+if (!function_exists('hasRole') || !hasRole('zone_supervisor')) {
+    header('Location: ../index.php');
+    exit();
+}
+
+$user         = getCurrentUser();
+$pdo          = getDB();
+$activeZoneId = (int)($user['zone_id'] ?? 0);
+
+// ============================================================
+// GLOBAL SETTINGS
+// ============================================================
+if (!function_exists('ws_al_global')) {
+    function ws_al_global(string $key, $default = null) {
+        if (function_exists('getSetting')) {
+            $v = getSetting($key);
+            return $v !== null ? $v : $default;
+        }
+        try {
+            $stmt = getDB()->prepare("SELECT setting_value FROM settings WHERE setting_key = ? LIMIT 1");
+            $stmt->execute([$key]);
+            $row = $stmt->fetch();
+            return $row ? $row['setting_value'] : $default;
+        } catch (PDOException $e) {
+            return $default;
+        }
+    }
+}
+
+$globalAiEnabled       = (string) ws_al_global('ai_enabled', '1')          === '1';
+$globalNotifyAlarm     = (string) ws_al_global('notify_on_alarm', '1')     === '1';
+$globalSmsEnabled      = (string) ws_al_global('sms_enabled', '1')         === '1';
+$globalAiAutoTrigger   = (string) ws_al_global('ai_auto_trigger_alarm', '0') === '1';
+
+// ============================================================
+// SAFE HELPERS
+// ============================================================
+if (!function_exists('safeCount')) {
+    function safeCount(PDO $pdo, string $sql, array $params = []): int {
+        try {
+            $stmt = $pdo->prepare($sql);
+            $stmt->execute($params);
+            return (int)($stmt->fetch()['count'] ?? 0);
+        } catch (PDOException $e) { return 0; }
+    }
+}
+if (!function_exists('safeFetchAll')) {
+    function safeFetchAll(PDO $pdo, string $sql, array $params = []): array {
+        try {
+            $stmt = $pdo->prepare($sql);
+            $stmt->execute($params);
+            return $stmt->fetchAll();
+        } catch (PDOException $e) { return []; }
+    }
+}
+if (!function_exists('ws_al_safe_url')) {
+    function ws_al_safe_url(?string $url): ?string {
+        $url = trim((string)$url);
+        if ($url === '') return null;
+        $p = parse_url($url);
+        if (!$p || empty($p['scheme'])) return null;
+        $scheme = strtolower($p['scheme']);
+        if (!in_array($scheme, ['http','https'], true)) return null;
+        return $url;
+    }
+}
+
+// ============================================================
+// AUTO-CREATE / MIGRATE TABLES
+// ============================================================
+try {
+    $pdo->exec("
+        CREATE TABLE IF NOT EXISTS alarm_systems (
+            id INT(11) AUTO_INCREMENT PRIMARY KEY,
+            zone_id INT(11) NOT NULL,
+            alarm_name VARCHAR(255) NOT NULL,
+            alarm_type ENUM('siren','bell','strobe','speaker','combined') DEFAULT 'siren',
+            sound_url VARCHAR(500) NULL,
+            sound_volume INT DEFAULT 80,
+            siren_duration INT DEFAULT 180,
+            trigger_delay_seconds INT DEFAULT 120,
+            auto_sound_on_incident TINYINT(1) DEFAULT 1,
+            location_lat DECIMAL(10,8) NULL,
+            location_lng DECIMAL(11,8) NULL,
+            is_active TINYINT(1) DEFAULT 1,
+            last_triggered DATETIME NULL,
+            trigger_count INT DEFAULT 0,
+            created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+        ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
+    ");
+
+    $pdo->exec("
+        CREATE TABLE IF NOT EXISTS alarm_triggers (
+            id INT(11) AUTO_INCREMENT PRIMARY KEY,
+            alarm_id INT(11) NULL,
+            alert_id INT(11) NULL,
+            incident_id INT(11) NULL,
+            zone_id INT(11) NOT NULL,
+            triggered_by ENUM('ai_detection','manual','schedule','auto_incident') DEFAULT 'manual',
+            trigger_reason VARCHAR(255) NULL,
+            triggered_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+            stopped_at DATETIME NULL,
+            duration_seconds INT NULL,
+            was_acknowledged TINYINT(1) DEFAULT 0,
+            acknowledged_by INT(11) NULL,
+            acknowledged_at DATETIME NULL,
+            INDEX idx_zone (zone_id),
+            INDEX idx_active (stopped_at),
+            INDEX idx_incident (incident_id)
+        ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
+    ");
+
+    $existingCols = [];
+    try {
+        $colStmt = $pdo->query("SHOW COLUMNS FROM alarm_systems");
+        foreach ($colStmt->fetchAll() as $c) $existingCols[] = $c['Field'];
+    } catch (PDOException $e) {}
+
+    foreach ([
+        'sound_url'              => "VARCHAR(500) NULL",
+        'sound_volume'           => "INT DEFAULT 80",
+        'siren_duration'         => "INT DEFAULT 180",
+        'trigger_delay_seconds'  => "INT DEFAULT 120",
+        'auto_sound_on_incident' => "TINYINT(1) DEFAULT 1",
+    ] as $col => $def) {
+        if (!in_array($col, $existingCols)) {
+            try { $pdo->exec("ALTER TABLE alarm_systems ADD COLUMN `$col` $def"); } catch (PDOException $e) {}
+        }
+    }
+} catch (PDOException $e) {
+    error_log('[WS-SUP-AL] DDL: ' . $e->getMessage());
+}
+
+// ============================================================
+// HANDLE ACTIONS
+// ============================================================
+$message = ''; $messageType = 'success';
+$autoSoundUrl = null; // used to trigger client-side autoplay via query string
+
+if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['action'])) {
+    $action = $_POST['action'];
+
+    // CREATE
+    if ($action === 'create') {
+        $name      = trim((string)($_POST['alarm_name'] ?? ''));
+        $type      = (string)($_POST['alarm_type'] ?? 'siren');
+        $soundUrl  = ws_al_safe_url($_POST['sound_url'] ?? '');
+        $volume    = max(0, min(100, (int)($_POST['sound_volume'] ?? 80)));
+        $sirenDur  = max(10, min(3600, (int)($_POST['siren_duration'] ?? 180)));
+        $delaySec  = max(30, min(1800, (int)($_POST['trigger_delay_seconds'] ?? 120)));
+        $autoSound = isset($_POST['auto_sound_on_incident']) ? 1 : 0;
+        $latRaw    = (string)($_POST['location_lat'] ?? '');
+        $lngRaw    = (string)($_POST['location_lng'] ?? '');
+        $lat       = $latRaw !== '' ? (float)$latRaw : null;
+        $lng       = $lngRaw !== '' ? (float)$lngRaw : null;
+
+        if ($name === '') {
+            $message = 'Alarm name is required.'; $messageType = 'danger';
+        } elseif (!in_array($type, ['siren','bell','strobe','speaker','combined'], true)) {
+            $message = 'Invalid alarm type.'; $messageType = 'danger';
+        } else {
+            try {
+                $pdo->prepare("
+                    INSERT INTO alarm_systems
+                        (zone_id, alarm_name, alarm_type, sound_url, sound_volume,
+                         siren_duration, trigger_delay_seconds, auto_sound_on_incident,
+                         location_lat, location_lng, is_active, trigger_count, created_at)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, 0, NOW())
+                ")->execute([
+                    $activeZoneId, $name, $type, $soundUrl, $volume,
+                    $sirenDur, $delaySec, $autoSound,
+                    $lat, $lng,
+                ]);
+                logAudit($user['id'], 'create_alarm', ['alarm_name' => $name, 'zone_id' => $activeZoneId]);
+                $message = "✅ Alarm '{$name}' added.";
+            } catch (PDOException $e) {
+                error_log('[WS-SUP-AL] create: ' . $e->getMessage());
+                $message = 'Could not create alarm.'; $messageType = 'danger';
+            }
+        }
+    }
+
+    // UPDATE
+    if ($action === 'update') {
+        $id        = (int)($_POST['alarm_id'] ?? 0);
+        $name      = trim((string)($_POST['alarm_name'] ?? ''));
+        $type      = (string)($_POST['alarm_type'] ?? 'siren');
+        $soundUrl  = ws_al_safe_url($_POST['sound_url'] ?? '');
+        $volume    = max(0, min(100, (int)($_POST['sound_volume'] ?? 80)));
+        $sirenDur  = max(10, min(3600, (int)($_POST['siren_duration'] ?? 180)));
+        $delaySec  = max(30, min(1800, (int)($_POST['trigger_delay_seconds'] ?? 120)));
+        $autoSound = isset($_POST['auto_sound_on_incident']) ? 1 : 0;
+        $latRaw    = (string)($_POST['location_lat'] ?? '');
+        $lngRaw    = (string)($_POST['location_lng'] ?? '');
+        $lat       = $latRaw !== '' ? (float)$latRaw : null;
+        $lng       = $lngRaw !== '' ? (float)$lngRaw : null;
+
+        if ($id <= 0 || $name === '') {
+            $message = 'Alarm name is required.'; $messageType = 'danger';
+        } elseif (!in_array($type, ['siren','bell','strobe','speaker','combined'], true)) {
+            $message = 'Invalid alarm type.'; $messageType = 'danger';
+        } else {
+            try {
+                $stmt = $pdo->prepare("
+                    UPDATE alarm_systems SET
+                        alarm_name = ?, alarm_type = ?, sound_url = ?, sound_volume = ?,
+                        siren_duration = ?, trigger_delay_seconds = ?, auto_sound_on_incident = ?,
+                        location_lat = ?, location_lng = ?
+                    WHERE id = ? AND zone_id = ?
+                ");
+                $stmt->execute([
+                    $name, $type, $soundUrl, $volume,
+                    $sirenDur, $delaySec, $autoSound,
+                    $lat, $lng, $id, $activeZoneId,
+                ]);
+                logAudit($user['id'], 'update_alarm', ['alarm_id' => $id, 'zone_id' => $activeZoneId]);
+                $message = "✅ Alarm '{$name}' updated.";
+            } catch (PDOException $e) {
+                error_log('[WS-SUP-AL] update: ' . $e->getMessage());
+                $message = 'Could not update alarm.'; $messageType = 'danger';
+            }
+        }
+    }
+
+    // TOGGLE
+    if ($action === 'toggle') {
+        $id = (int)($_POST['alarm_id'] ?? 0);
+        try {
+            $row = $pdo->prepare("SELECT alarm_name, is_active FROM alarm_systems WHERE id = ? AND zone_id = ? LIMIT 1");
+            $row->execute([$id, $activeZoneId]);
+            $a = $row->fetch();
+            if (!$a) { $message = 'Alarm not found.'; $messageType = 'danger'; }
+            else {
+                $pdo->prepare("UPDATE alarm_systems SET is_active = NOT is_active WHERE id = ? AND zone_id = ?")->execute([$id, $activeZoneId]);
+                $newState = (int)$a['is_active'] === 1 ? 'disabled' : 'enabled';
+                logAudit($user['id'], 'toggle_alarm', ['alarm_id' => $id, 'new_state' => $newState]);
+                $message = "✅ Alarm '{$a['alarm_name']}' {$newState}.";
+            }
+        } catch (PDOException $e) {
+            error_log('[WS-SUP-AL] toggle: ' . $e->getMessage());
+            $message = 'Could not toggle alarm.'; $messageType = 'danger';
+        }
+    }
+
+    // MANUAL TRIGGER (hardened)
+    if ($action === 'trigger') {
+        $id = (int)($_POST['alarm_id'] ?? 0);
+        try {
+            $row = $pdo->prepare("SELECT * FROM alarm_systems WHERE id = ? AND zone_id = ? LIMIT 1");
+            $row->execute([$id, $activeZoneId]);
+            $a = $row->fetch();
+
+            if (!$a) { $message = 'Alarm not found.'; $messageType = 'danger'; }
+            elseif ((int)$a['is_active'] !== 1) {
+                $message = "❌ Alarm '{$a['alarm_name']}' is inactive. Enable it first."; $messageType = 'danger';
+            } else {
+                // Guard against duplicate active trigger
+                $dup = $pdo->prepare("SELECT id FROM alarm_triggers WHERE alarm_id = ? AND stopped_at IS NULL LIMIT 1");
+                $dup->execute([$id]);
+                if ($dup->fetch()) {
+                    $message = "ℹ️ Alarm '{$a['alarm_name']}' is already active."; $messageType = 'warning';
+                } else {
+                    $pdo->prepare("
+                        INSERT INTO alarm_triggers
+                            (alarm_id, zone_id, triggered_by, trigger_reason, triggered_at)
+                        VALUES (?, ?, 'manual', 'Manual trigger by supervisor', NOW())
+                    ")->execute([$id, $activeZoneId]);
+                    $triggerId = (int)$pdo->lastInsertId();
+
+                    $pdo->prepare("
+                        UPDATE alarm_systems
+                        SET last_triggered = NOW(), trigger_count = trigger_count + 1
+                        WHERE id = ?
+                    ")->execute([$id]);
+
+                    // Best-effort hardware hook
+                    if (function_exists('ws_alarm_trigger_hardware')) {
+                        try { ws_alarm_trigger_hardware((int)$a['id'], $triggerId); }
+                        catch (Throwable $e) { error_log('[WS-SUP-AL] trigger hardware: ' . $e->getMessage()); }
+                    }
+
+                    // Notify rangers/supervisors in zone (respects notify_on_alarm)
+                    $notified = 0; $suppressed = 0;
+                    if ($globalNotifyAlarm) {
+                        $recipients = safeFetchAll($pdo, "
+                            SELECT id FROM users
+                            WHERE zone_id = ? AND role IN ('ranger','zone_supervisor') AND is_active = 1
+                        ", [$activeZoneId]);
+                        foreach ($recipients as $r) {
+                            if (function_exists('createNotification')) {
+                                try {
+                                    createNotification((int)$r['id'], 'alarm', '🔔 Alarm Triggered',
+                                        "{$a['alarm_name']} triggered manually.", null);
+                                    $notified++;
+                                } catch (Throwable $e) { $suppressed++; }
+                            }
+                        }
+                    }
+
+                    // WebSocket broadcast
+                    if (function_exists('broadcastToWS')) {
+                        try {
+                            broadcastToWS('alarm-triggered', [
+                                'zone_id'    => $activeZoneId,
+                                'alarm_id'   => (int)$a['id'],
+                                'alarm_name' => $a['alarm_name'],
+                                'trigger_id' => $triggerId,
+                            ]);
+                        } catch (Throwable $e) { /* silent */ }
+                    }
+
+                    logAudit($user['id'], 'trigger_alarm', [
+                        'alarm_id' => $id, 'trigger_id' => $triggerId,
+                        'notified' => $notified, 'suppressed' => $suppressed,
+                    ]);
+
+                    $msg = "🔊 Alarm '{$a['alarm_name']}' triggered manually.";
+                    if (!$globalNotifyAlarm) $msg .= ' (notifications suppressed by settings)';
+                    $message = $msg;
+
+                    // Autoplay hint via query string
+                    if (!empty($a['sound_url'])) {
+                        $autoSoundUrl = $a['sound_url'];
+                        // Preserve message
+                        $_SESSION['flash_msg'] = $message;
+                        header("Location: alarm-systems.php?sound=1&trigger_id={$triggerId}");
+                        exit;
+                    }
+                }
+            }
+        } catch (PDOException $e) {
+            error_log('[WS-SUP-AL] trigger: ' . $e->getMessage());
+            $message = 'Could not trigger alarm.'; $messageType = 'danger';
+        }
+    }
+
+    // STOP TRIGGER (idempotent)
+    if ($action === 'stop_trigger') {
+        $tid = (int)($_POST['trigger_id'] ?? 0);
+        try {
+            $row = $pdo->prepare("
+                SELECT at.id, at.stopped_at, a.alarm_name
+                FROM alarm_triggers at
+                LEFT JOIN alarm_systems a ON at.alarm_id = a.id
+                WHERE at.id = ? AND at.zone_id = ?
+                LIMIT 1
+            ");
+            $row->execute([$tid, $activeZoneId]);
+            $t = $row->fetch();
+
+            if (!$t) { $message = 'Trigger not found.'; $messageType = 'danger'; }
+            elseif (!empty($t['stopped_at'])) { $message = 'This alarm was already stopped.'; }
+            else {
+                $stmt = $pdo->prepare("
+                    UPDATE alarm_triggers SET
+                        stopped_at = NOW(),
+                        duration_seconds = TIMESTAMPDIFF(SECOND, triggered_at, NOW()),
+                        was_acknowledged = 1,
+                        acknowledged_by = ?,
+                        acknowledged_at = NOW()
+                    WHERE id = ? AND zone_id = ? AND stopped_at IS NULL
+                ");
+                $stmt->execute([$user['id'], $tid, $activeZoneId]);
+
+                if (function_exists('ws_alarm_stop_hardware')) {
+                    try { ws_alarm_stop_hardware((int)$t['id'], $tid); }
+                    catch (Throwable $e) { /* silent */ }
+                }
+
+                logAudit($user['id'], 'stop_alarm', ['trigger_id' => $tid, 'alarm_name' => $t['alarm_name'] ?? '']);
+                $message = '✅ Alarm stopped.';
+            }
+        } catch (PDOException $e) {
+            error_log('[WS-SUP-AL] stop_trigger: ' . $e->getMessage());
+            $message = 'Could not stop alarm.'; $messageType = 'danger';
+        }
+    }
+
+    // STOP ALL
+    if ($action === 'stop_all') {
+        try {
+            $stmt = $pdo->prepare("
+                UPDATE alarm_triggers SET
+                    stopped_at = NOW(),
+                    duration_seconds = TIMESTAMPDIFF(SECOND, triggered_at, NOW()),
+                    was_acknowledged = 1,
+                    acknowledged_by = ?,
+                    acknowledged_at = NOW()
+                WHERE zone_id = ? AND stopped_at IS NULL
+            ");
+            $stmt->execute([$user['id'], $activeZoneId]);
+            $count = $stmt->rowCount();
+            logAudit($user['id'], 'stop_all_alarms', ['zone_id' => $activeZoneId, 'count' => $count]);
+            $message = "✅ Stopped {$count} active alarm" . ($count === 1 ? '' : 's') . ".";
+        } catch (PDOException $e) {
+            error_log('[WS-SUP-AL] stop_all: ' . $e->getMessage());
+            $message = 'Could not stop alarms.'; $messageType = 'danger';
+        }
+    }
+
+    // DELETE
+    if ($action === 'delete') {
+        $id = (int)($_POST['alarm_id'] ?? 0);
+        try {
+            $activeCount = safeCount($pdo, "
+                SELECT COUNT(*) as count FROM alarm_triggers
+                WHERE alarm_id = ? AND stopped_at IS NULL
+            ", [$id]);
+            if ($activeCount > 0) {
+                $message = "❌ Cannot delete — this alarm has {$activeCount} active trigger(s). Stop them first.";
+                $messageType = 'danger';
+            } else {
+                $row = $pdo->prepare("SELECT alarm_name FROM alarm_systems WHERE id = ? AND zone_id = ? LIMIT 1");
+                $row->execute([$id, $activeZoneId]);
+                $a = $row->fetch();
+                if (!$a) { $message = 'Alarm not found.'; $messageType = 'danger'; }
+                else {
+                    $pdo->prepare("DELETE FROM alarm_systems WHERE id = ? AND zone_id = ?")->execute([$id, $activeZoneId]);
+                    logAudit($user['id'], 'delete_alarm', ['alarm_id' => $id, 'name' => $a['alarm_name']]);
+                    $message = "🗑️ Alarm '{$a['alarm_name']}' deleted.";
+                }
+            }
+        } catch (PDOException $e) {
+            error_log('[WS-SUP-AL] delete: ' . $e->getMessage());
+            $message = 'Could not delete alarm.'; $messageType = 'danger';
+        }
+    }
+}
+
+// Retrieve flash message after redirect
+if (!empty($_SESSION['flash_msg'])) {
+    $message = $_SESSION['flash_msg'];
+    $messageType = 'success';
+    unset($_SESSION['flash_msg']);
+}
+
+// ============================================================
+// FETCH
+// ============================================================
+$filterStatus = in_array($_GET['status'] ?? '', ['active','inactive'], true) ? (string)$_GET['status'] : '';
+$filterType   = in_array($_GET['type'] ?? '', ['siren','bell','strobe','speaker','combined'], true) ? (string)$_GET['type'] : '';
+$search       = trim((string)($_GET['search'] ?? ''));
+
+$where  = " WHERE a.zone_id = ? ";
+$params = [$activeZoneId];
+
+if ($filterStatus === 'active')   $where .= " AND a.is_active = 1 ";
+if ($filterStatus === 'inactive') $where .= " AND a.is_active = 0 ";
+if ($filterType !== '') { $where .= " AND a.alarm_type = ? "; $params[] = $filterType; }
+if ($search !== '')     { $where .= " AND a.alarm_name LIKE ? "; $params[] = '%' . $search . '%'; }
+
+$alarms = safeFetchAll($pdo, "
+    SELECT a.*,
+           (SELECT COUNT(*) FROM alarm_triggers at WHERE at.alarm_id = a.id AND at.stopped_at IS NULL) AS active_triggers
+    FROM alarm_systems a
+    $where
+    ORDER BY a.is_active DESC, a.alarm_name
+", $params);
+
+$activeTriggers = safeFetchAll($pdo, "
+    SELECT at.*, a.alarm_name, a.sound_url, a.sound_volume
+    FROM alarm_triggers at
+    JOIN alarm_systems a ON at.alarm_id = a.id
+    WHERE at.zone_id = ? AND at.stopped_at IS NULL
+    ORDER BY at.triggered_at DESC
+    LIMIT 20
+", [$activeZoneId]);
+
+$recentTriggers = safeFetchAll($pdo, "
+    SELECT at.*, a.alarm_name
+    FROM alarm_triggers at
+    JOIN alarm_systems a ON at.alarm_id = a.id
+    WHERE at.zone_id = ?
+    ORDER BY at.triggered_at DESC
+    LIMIT 20
+", [$activeZoneId]);
+
+$stats = [
+    'total'           => safeCount($pdo, "SELECT COUNT(*) as count FROM alarm_systems WHERE zone_id = ?", [$activeZoneId]),
+    'active'          => safeCount($pdo, "SELECT COUNT(*) as count FROM alarm_systems WHERE zone_id = ? AND is_active = 1", [$activeZoneId]),
+    'inactive'        => safeCount($pdo, "SELECT COUNT(*) as count FROM alarm_systems WHERE zone_id = ? AND is_active = 0", [$activeZoneId]),
+    'active_triggers' => safeCount($pdo, "SELECT COUNT(*) as count FROM alarm_triggers WHERE zone_id = ? AND stopped_at IS NULL", [$activeZoneId]),
+    'today_triggers'  => safeCount($pdo, "SELECT COUNT(*) as count FROM alarm_triggers WHERE zone_id = ? AND DATE(triggered_at) = CURDATE()", [$activeZoneId]),
+    'total_triggers'  => safeCount($pdo, "SELECT COUNT(*) as count FROM alarm_triggers WHERE zone_id = ?", [$activeZoneId]),
+];
+
+$typeIcons = ['siren' => '🚨', 'bell' => '🔔', 'strobe' => '💡', 'speaker' => '📢', 'combined' => '🚨🔔'];
+
+$presetSounds = [
+    '' => 'Silent (no sound)',
+    'https://actions.google.com/sounds/v1/alarms/alarm_clock.ogg' => '🚨 Classic Alarm Clock (Google)',
+    'https://actions.google.com/sounds/v1/alarms/beep_short.ogg' => '🔔 Short Beep (Google)',
+    'https://actions.google.com/sounds/v1/alarms/bugle_tune.ogg' => '🚨 Bugle Tune (Google)',
+    'https://actions.google.com/sounds/v1/alarms/digital_watch_alarm_long.ogg' => '🔔 Digital Watch Alarm',
+    'https://actions.google.com/sounds/v1/alarms/medium_bell_ringing_near.ogg' => '🔔 Bell Ring (Google)',
+];
+$zoneName = function_exists('getZoneName') ? (getZoneName($activeZoneId) ?: 'Your Zone') : 'Your Zone';
+?>
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+    <title>Alarm Systems - Supervisor - Wildlife Sentinel</title>
+    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css">
+    <link rel="stylesheet" href="../assets/css/style.css">
+    <link rel="stylesheet" href="../assets/css/transitions.css">
+    <style>
+        .dashboard-greeting { margin-bottom: 24px; }
+        .dashboard-greeting h1 { font-size: 28px; color: #0d3b22; }
+        .dashboard-greeting p  { color: #6c757d; font-size: 16px; }
+
+        .quick-nav { display: flex; gap: 8px; flex-wrap: wrap; margin-bottom: 16px; }
+        .quick-nav .btn { font-size: 12px; padding: 6px 12px; }
+
+        .state-banner { display: flex; align-items: center; gap: 10px; padding: 10px 14px; border-radius: 10px; margin-bottom: 14px; font-size: 12.5px; }
+        .state-banner.warn { background: #fff3cd; border: 1px solid #ffc107; color: #856404; }
+
+        .stats-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); gap: 14px; margin-bottom: 24px; }
+        .stat-card { background: white; border-radius: 12px; padding: 16px 18px; box-shadow: 0 2px 8px rgba(0,0,0,0.06); display: flex; align-items: center; gap: 12px; border: 1px solid #f0f0f0; transition: all 0.3s; }
+        .stat-card:hover { transform: translateY(-3px); box-shadow: 0 8px 25px rgba(0,0,0,0.1); }
+        .stat-card .icon { width: 44px; height: 44px; border-radius: 10px; display: flex; align-items: center; justify-content: center; font-size: 20px; flex-shrink: 0; }
+        .stat-card .icon.blue { background: #cce5ff; color: #004085; }
+        .stat-card .icon.green { background: #d4edda; color: #155724; }
+        .stat-card .icon.red { background: #f8d7da; color: #721c24; }
+        .stat-card .icon.orange { background: #fff3cd; color: #856404; }
+        .stat-card .icon.purple { background: #e8d5f5; color: #6f42c1; }
+        .stat-card .info .number { font-size: 22px; font-weight: 700; color: #0d3b22; }
+        .stat-card .info .label  { font-size: 11px; color: #6c757d; }
+
+        .section { background: white; border-radius: 14px; padding: 20px 22px; margin-bottom: 20px; box-shadow: 0 2px 12px rgba(0,0,0,0.06); border: 1px solid #f0f0f0; }
+        .section-header { display: flex; justify-content: space-between; align-items: center; margin-bottom: 14px; flex-wrap: wrap; gap: 10px; }
+        .section-header h2 { font-size: 17px; color: #0d3b22; display: flex; align-items: center; gap: 10px; }
+
+        .btn { padding: 9px 18px; border-radius: 8px; border: none; cursor: pointer; font-size: 13px; font-weight: 600; transition: all 0.2s; text-decoration: none; display: inline-flex; align-items: center; gap: 6px; }
+        .btn-primary { background: #1a5c3a; color: white; }
+        .btn-primary:hover { background: #0d3b22; }
+        .btn-secondary { background: #f0f0f0; color: #495057; }
+        .btn-danger { background: #dc3545; color: white; }
+        .btn-success { background: #28a745; color: white; }
+        .btn-warning { background: #ffc107; color: #212529; }
+        .btn-sm { padding: 6px 12px; font-size: 12px; }
+        .btn:disabled { opacity: .5; cursor: not-allowed; }
+
+        .alert { padding: 12px 16px; border-radius: 10px; margin-bottom: 16px; font-size: 14px; }
+        .alert.success { background: #d4edda; color: #155724; }
+        .alert.danger  { background: #f8d7da; color: #721c24; }
+        .alert.warning { background: #fff3cd; color: #856404; }
+
+        .filter-bar { display: grid; grid-template-columns: repeat(auto-fit, minmax(160px, 1fr)); gap: 12px; align-items: end; }
+        .filter-group { display: flex; flex-direction: column; gap: 4px; }
+        .filter-group label { font-size: 11px; color: #6c757d; text-transform: uppercase; letter-spacing: 0.5px; font-weight: 600; }
+        .filter-group input, .filter-group select { padding: 9px 12px; border: 1px solid #e0e0e0; border-radius: 8px; font-size: 13px; background: #fafafa; }
+
+        .alarm-table { width: 100%; border-collapse: collapse; }
+        .alarm-table thead th { text-align: left; font-size: 11px; color: #6c757d; text-transform: uppercase; letter-spacing: 0.5px; padding: 10px 12px; border-bottom: 2px solid #f0f0f0; background: #fafafa; font-weight: 700; }
+        .alarm-table tbody tr { border-bottom: 1px solid #f5f5f5; }
+        .alarm-table tbody tr:hover { background: #fafafa; }
+        .alarm-table td { padding: 12px; font-size: 13px; vertical-align: middle; }
+
+        .alarm-icon { width: 38px; height: 38px; border-radius: 8px; display: inline-flex; align-items: center; justify-content: center; font-size: 18px; background: #fdf5f5; flex-shrink: 0; }
+
+        .status-pill { padding: 3px 10px; border-radius: 12px; font-size: 10px; font-weight: 700; text-transform: uppercase; display: inline-block; }
+        .status-pill.active { background: #d4edda; color: #155724; }
+        .status-pill.inactive { background: #e9ecef; color: #495057; }
+        .status-pill.triggered { background: #dc3545; color: white; animation: pulse 1.5s infinite; }
+        @keyframes pulse { 0%,100% { opacity: 1; } 50% { opacity: 0.5; } }
+
+        .trigger-card {
+            padding: 16px 20px; border-radius: 14px;
+            background: linear-gradient(135deg, #fdf5f5, #ffe8e8);
+            border-left: 6px solid #dc3545;
+            margin-bottom: 14px;
+            display: flex; align-items: center; gap: 16px; flex-wrap: wrap;
+            box-shadow: 0 4px 15px rgba(220,53,69,0.15);
+            animation: triggerPulse 2s ease-in-out infinite;
+        }
+        @keyframes triggerPulse {
+            0%, 100% { box-shadow: 0 4px 15px rgba(220,53,69,0.15); }
+            50% { box-shadow: 0 4px 25px rgba(220,53,69,0.4); }
+        }
+        .trigger-card .trigger-icon { font-size: 36px; animation: shake 0.6s infinite; }
+        @keyframes shake {
+            0%,100% { transform: rotate(0deg); }
+            25% { transform: rotate(-12deg); }
+            75% { transform: rotate(12deg); }
+        }
+        .trigger-card .trigger-info { flex: 1; min-width: 200px; }
+        .trigger-card .trigger-info .trigger-title { font-weight: 800; font-size: 16px; color: #0d3b22; }
+        .trigger-card .trigger-info .trigger-meta { font-size: 12px; color: #6c757d; margin-top: 3px; }
+
+        .modal-backdrop { position: fixed; inset: 0; background: rgba(0,0,0,0.5); z-index: 2000; display: none; align-items: center; justify-content: center; padding: 20px; }
+        .modal-backdrop.show { display: flex; }
+        .modal { background: white; border-radius: 14px; max-width: 600px; width: 100%; max-height: 90vh; overflow-y: auto; box-shadow: 0 20px 60px rgba(0,0,0,0.3); }
+        .modal-header { padding: 18px 22px; border-bottom: 1px solid #f0f0f0; display: flex; justify-content: space-between; align-items: center; }
+        .modal-header h3 { font-size: 18px; color: #0d3b22; }
+        .modal-close { background: none; border: none; font-size: 24px; cursor: pointer; color: #6c757d; }
+        .modal-body { padding: 22px; }
+        .modal-footer { padding: 16px 22px; border-top: 1px solid #f0f0f0; display: flex; justify-content: flex-end; gap: 10px; }
+
+        .form-row { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; }
+        .form-row.three { grid-template-columns: 1fr 1fr 1fr; }
+        .form-group { margin-bottom: 14px; }
+        .form-group label { display: block; font-size: 12px; color: #495057; font-weight: 600; margin-bottom: 6px; }
+        .form-group input, .form-group select { width: 100%; padding: 10px 14px; border: 1px solid #e0e0e0; border-radius: 8px; font-size: 13px; background: #fafafa; font-family: inherit; }
+        .form-group input:focus, .form-group select:focus { outline: none; border-color: #1a5c3a; background: white; }
+        .form-group .hint { font-size: 11px; color: #6c757d; margin-top: 4px; display: block; }
+
+        .toggle-row { display: flex; justify-content: space-between; align-items: center; padding: 12px 0; }
+        .toggle-row .toggle-info { flex: 1; padding-right: 12px; }
+        .toggle-row .toggle-label { font-size: 13px; font-weight: 600; color: #0d3b22; }
+        .toggle-row .toggle-desc { font-size: 11px; color: #6c757d; margin-top: 2px; }
+        .switch { position: relative; display: inline-block; width: 46px; height: 26px; flex-shrink: 0; }
+        .switch input { opacity: 0; width: 0; height: 0; }
+        .switch .slider { position: absolute; cursor: pointer; top: 0; left: 0; right: 0; bottom: 0; background-color: #ccc; transition: .3s; border-radius: 26px; }
+        .switch .slider:before { position: absolute; content: ""; height: 20px; width: 20px; left: 3px; bottom: 3px; background-color: white; transition: .3s; border-radius: 50%; }
+        .switch input:checked + .slider { background-color: #28a745; }
+        .switch input:checked + .slider:before { transform: translateX(20px); }
+
+        .test-sound-btn { padding: 6px 12px; font-size: 11px; background: #17a2b8; color: white; border-radius: 6px; border: none; cursor: pointer; font-weight: 600; }
+        .test-sound-btn:hover { background: #138496; }
+
+        .empty-state { text-align:center; padding:40px 20px; color:#6c757d; }
+        .empty-state .icon { font-size: 48px; display: block; margin-bottom: 10px; opacity: 0.4; }
+
+        @media (max-width: 1024px) {
+            .alarm-table thead { display: none; }
+            .alarm-table, .alarm-table tbody, .alarm-table tr, .alarm-table td { display: block; width: 100%; }
+            .alarm-table tr { margin-bottom: 12px; padding: 12px; border-radius: 10px; background: #fafafa; border: 1px solid #f0f0f0; }
+            .alarm-table td { padding: 4px 0; border: none; }
+            .alarm-table td::before { content: attr(data-label); font-size: 10px; text-transform: uppercase; color: #adb5bd; display: block; margin-bottom: 2px; }
+        }
+        @media (max-width: 768px) {
+            .stats-grid { grid-template-columns: 1fr 1fr; gap: 10px; }
+            .dashboard-greeting h1 { font-size: 22px; }
+            .form-row, .form-row.three { grid-template-columns: 1fr; }
+        }
+    </style>
+</head>
+<body>
+    <div class="app-container">
+        <?php include '../includes/sidebar.php'; ?>
+
+        <main class="main-content">
+            <header class="top-header">
+                <button class="menu-toggle" onclick="toggleSidebar()">☰</button>
+                <h1>Alarm Systems</h1>
+                <div class="header-right">
+                    <span class="online-status">● Online</span>
+                    <span class="data-honesty-badge">🟢 Live Data</span>
+                    <span class="user-name"><?= htmlspecialchars($user['full_name']) ?></span>
+                </div>
+            </header>
+
+            <div class="content">
+                <div class="dashboard-greeting">
+                    <h1>🔔 Alarm Systems</h1>
+                    <p>Manage real alarms for <strong><?= htmlspecialchars($zoneName) ?></strong> — sound them manually or let the system trigger them automatically.</p>
+                </div>
+
+                <div class="quick-nav">
+                    <a href="dashboard.php" class="btn btn-secondary">🏠 Dashboard</a>
+                    <a href="incidents.php" class="btn btn-secondary">📋 Incidents</a>
+                    <a href="ai-dashboard.php" class="btn btn-secondary">🤖 AI Dashboard</a>
+                    <a href="zone-settings.php" class="btn btn-secondary">⚙️ Zone Settings</a>
+                </div>
+
+                <?php if (!$globalNotifyAlarm): ?>
+                    <div class="state-banner warn">
+                        <span>🔕</span>
+                        <div>
+                            <strong>Alarm notifications are suppressed by admin.</strong>
+                            Alarms will still sound locally, but rangers/supervisors won't receive in-app alerts.
+                        </div>
+                    </div>
+                <?php endif; ?>
+
+                <?php if (!$globalAiAutoTrigger): ?>
+                    <div class="state-banner warn">
+                        <span>ℹ️</span>
+                        <div>
+                            <strong>AI auto-trigger is OFF globally.</strong>
+                            Alarms won't fire automatically on AI detections.
+                        </div>
+                    </div>
+                <?php endif; ?>
+
+                <?php if ($message): ?>
+                    <div class="alert <?= htmlspecialchars($messageType) ?>"><?= $message ?></div>
+                <?php endif; ?>
+
+                <?php if (count($activeTriggers) > 0): ?>
+                <div style="display:flex;gap:12px;margin-bottom:18px;flex-wrap:wrap;">
+                    <form method="POST" style="display:inline;" onsubmit="return confirm('Stop ALL active alarms?');">
+                        <input type="hidden" name="action" value="stop_all">
+                        <button class="btn btn-danger" style="padding:14px 24px;font-size:14px;">
+                            <i class="fas fa-stop-circle"></i> Stop All Active Alarms (<?= count($activeTriggers) ?>)
+                        </button>
+                    </form>
+                </div>
+                <?php endif; ?>
+
+                <!-- Stats -->
+                <div class="stats-grid">
+                    <div class="stat-card"><div class="icon blue">🔔</div><div class="info"><div class="number"><?= (int)$stats['total'] ?></div><div class="label">Total Alarms</div></div></div>
+                    <div class="stat-card"><div class="icon green">✅</div><div class="info"><div class="number"><?= (int)$stats['active'] ?></div><div class="label">Active</div></div></div>
+                    <div class="stat-card"><div class="icon orange">⚪</div><div class="info"><div class="number"><?= (int)$stats['inactive'] ?></div><div class="label">Inactive</div></div></div>
+                    <div class="stat-card"><div class="icon red">🚨</div><div class="info"><div class="number"><?= (int)$stats['active_triggers'] ?></div><div class="label">Active Triggers</div></div></div>
+                    <div class="stat-card"><div class="icon purple">📅</div><div class="info"><div class="number"><?= (int)$stats['today_triggers'] ?></div><div class="label">Today</div></div></div>
+                    <div class="stat-card"><div class="icon blue">📊</div><div class="info"><div class="number"><?= (int)$stats['total_triggers'] ?></div><div class="label">Total Triggers</div></div></div>
+                </div>
+
+                <!-- Active triggers -->
+                <?php if (count($activeTriggers) > 0): ?>
+                <div class="section" style="border-left:4px solid #dc3545;">
+                    <div class="section-header"><h2>🚨 Active Triggers (<?= count($activeTriggers) ?>)</h2></div>
+                    <?php foreach ($activeTriggers as $t): ?>
+                        <div class="trigger-card" data-trigger-id="<?= (int)$t['id'] ?>">
+                            <div class="trigger-icon">🚨</div>
+                            <div class="trigger-info">
+                                <div class="trigger-title"><?= htmlspecialchars($t['alarm_name']) ?></div>
+                                <div class="trigger-meta">
+                                    👤 <?= htmlspecialchars(ucfirst(str_replace('_',' ',$t['triggered_by']))) ?>
+                                    • 🕐 <?= timeAgo($t['triggered_at']) ?>
+                                    • running <?= max(0, time() - strtotime($t['triggered_at'])) ?>s
+                                    <?php if ($t['trigger_reason']): ?>
+                                        • 📝 <?= htmlspecialchars($t['trigger_reason']) ?>
+                                    <?php endif; ?>
+                                </div>
+                            </div>
+                            <div style="display:flex;gap:8px;flex-wrap:wrap;">
+                                <?php if (!empty($t['sound_url'])): ?>
+                                    <button class="btn btn-warning btn-sm"
+                                            data-sound="<?= htmlspecialchars($t['sound_url'], ENT_QUOTES) ?>"
+                                            data-volume="<?= (int)$t['sound_volume'] ?>"
+                                            onclick="playSoundFromBtn(this)">🔊 Sound Again</button>
+                                <?php endif; ?>
+                                <form method="POST" style="display:inline;">
+                                    <input type="hidden" name="action" value="stop_trigger">
+                                    <input type="hidden" name="trigger_id" value="<?= (int)$t['id'] ?>">
+                                    <button class="btn btn-danger btn-sm" onclick="stopAllSounds()">⏹️ Stop</button>
+                                </form>
+                            </div>
+                        </div>
+                    <?php endforeach; ?>
+                </div>
+                <?php endif; ?>
+
+                <!-- Filters -->
+                <div class="section">
+                    <div class="section-header">
+                        <h2>🔎 Filter Alarms</h2>
+                        <?php if ($filterStatus || $filterType || $search): ?>
+                            <a href="alarm-systems.php" class="btn btn-secondary btn-sm">✕ Clear</a>
+                        <?php endif; ?>
+                    </div>
+                    <form method="GET" class="filter-bar">
+                        <div class="filter-group">
+                            <label>Status</label>
+                            <select name="status">
+                                <option value="">All</option>
+                                <option value="active"   <?= $filterStatus === 'active'   ? 'selected' : '' ?>>Active</option>
+                                <option value="inactive" <?= $filterStatus === 'inactive' ? 'selected' : '' ?>>Inactive</option>
+                            </select>
+                        </div>
+                        <div class="filter-group">
+                            <label>Type</label>
+                            <select name="type">
+                                <option value="">All Types</option>
+                                <?php foreach (['siren','bell','strobe','speaker','combined'] as $tp): ?>
+                                    <option value="<?= $tp ?>" <?= $filterType === $tp ? 'selected' : '' ?>><?= ucfirst($tp) ?></option>
+                                <?php endforeach; ?>
+                            </select>
+                        </div>
+                        <div class="filter-group">
+                            <label>Search</label>
+                            <input type="text" name="search" value="<?= htmlspecialchars($search) ?>" placeholder="Alarm name">
+                        </div>
+                        <div class="filter-group">
+                            <label>&nbsp;</label>
+                            <button type="submit" class="btn btn-primary">🔎 Apply</button>
+                        </div>
+                    </form>
+                </div>
+
+                <!-- Alarms list -->
+                <div class="section">
+                    <div class="section-header">
+                        <h2>📋 Alarms (<?= count($alarms) ?>)</h2>
+                        <button class="btn btn-primary" onclick="openCreateModal()">
+                            <i class="fas fa-plus"></i> Add Alarm
+                        </button>
+                    </div>
+
+                    <?php if (count($alarms) > 0): ?>
+                        <table class="alarm-table">
+                            <thead>
+                                <tr>
+                                    <th style="width:50px;"></th>
+                                    <th>Alarm</th>
+                                    <th>Type / Sound</th>
+                                    <th>Status</th>
+                                    <th>Triggered</th>
+                                    <th>Actions</th>
+                                </tr>
+                            </thead>
+                            <tbody>
+                                <?php foreach ($alarms as $a): ?>
+                                    <?php $icon = $typeIcons[$a['alarm_type']] ?? '🔔'; ?>
+                                    <tr>
+                                        <td data-label=""><span class="alarm-icon"><?= $icon ?></span></td>
+                                        <td data-label="Alarm">
+                                            <div style="font-weight:600;color:#0d3b22;font-size:13px;"><?= htmlspecialchars($a['alarm_name']) ?></div>
+                                            <?php if ((int)$a['auto_sound_on_incident'] === 1): ?>
+                                                <div style="font-size:11px;color:#6c757d;">⏱️ Auto-sound after <?= (int)$a['trigger_delay_seconds'] ?>s if unacknowledged</div>
+                                            <?php endif; ?>
+                                        </td>
+                                        <td data-label="Type / Sound">
+                                            <div style="font-size:11px;text-transform:uppercase;"><?= htmlspecialchars($a['alarm_type']) ?></div>
+                                            <?php if (!empty($a['sound_url'])): ?>
+                                                <button class="test-sound-btn" style="margin-top:4px;"
+                                                        data-sound="<?= htmlspecialchars($a['sound_url'], ENT_QUOTES) ?>"
+                                                        data-volume="<?= (int)$a['sound_volume'] ?>"
+                                                        onclick="playSoundFromBtn(this)">🔊 Test (<?= (int)$a['sound_volume'] ?>%)</button>
+                                            <?php else: ?>
+                                                <div style="font-size:10px;color:#adb5bd;">No sound file</div>
+                                            <?php endif; ?>
+                                        </td>
+                                        <td data-label="Status">
+                                            <?php if (!$a['is_active']): ?>
+                                                <span class="status-pill inactive">⚪ Inactive</span>
+                                            <?php elseif ($a['active_triggers'] > 0): ?>
+                                                <span class="status-pill triggered">🚨 SOUNDING</span>
+                                            <?php else: ?>
+                                                <span class="status-pill active">✅ Active</span>
+                                            <?php endif; ?>
+                                        </td>
+                                        <td data-label="Triggered">
+                                            <?php if ($a['last_triggered']): ?>
+                                                <div style="font-size:12px;"><?= timeAgo($a['last_triggered']) ?></div>
+                                                <div style="font-size:10px;color:#6c757d;"><?= (int)$a['trigger_count'] ?> total</div>
+                                            <?php else: ?>
+                                                <span style="font-size:11px;color:#adb5bd;">Never</span>
+                                            <?php endif; ?>
+                                        </td>
+                                        <td data-label="Actions">
+                                            <div style="display:flex;gap:6px;flex-wrap:wrap;">
+                                                <button class="btn btn-sm btn-secondary"
+                                                        onclick='openEditModal(<?= htmlspecialchars(json_encode($a, JSON_HEX_APOS | JSON_HEX_QUOT | JSON_HEX_TAG | JSON_HEX_AMP), ENT_QUOTES) ?>)'>✏️ Edit</button>
+                                                <form method="POST" style="display:inline;">
+                                                    <input type="hidden" name="action" value="trigger">
+                                                    <input type="hidden" name="alarm_id" value="<?= (int)$a['id'] ?>">
+                                                    <button class="btn btn-sm btn-danger"
+                                                            <?= ((int)$a['is_active'] !== 1 || (int)$a['active_triggers'] > 0) ? 'disabled' : '' ?>
+                                                            onclick="return confirm('Trigger this alarm now?')">🔊 SOUND</button>
+                                                </form>
+                                                <form method="POST" style="display:inline;">
+                                                    <input type="hidden" name="action" value="toggle">
+                                                    <input type="hidden" name="alarm_id" value="<?= (int)$a['id'] ?>">
+                                                    <button class="btn btn-sm <?= $a['is_active'] ? 'btn-warning' : 'btn-success' ?>">
+                                                        <?= $a['is_active'] ? 'Disable' : 'Enable' ?>
+                                                    </button>
+                                                </form>
+                                                <button class="btn btn-sm btn-danger"
+                                                        <?= ((int)$a['active_triggers'] > 0) ? 'disabled title="Stop active triggers first"' : '' ?>
+                                                        onclick="confirmDelete(<?= (int)$a['id'] ?>, '<?= htmlspecialchars($a['alarm_name'], ENT_QUOTES) ?>')">🗑️</button>
+                                            </div>
+                                        </td>
+                                    </tr>
+                                <?php endforeach; ?>
+                            </tbody>
+                        </table>
+                    <?php else: ?>
+                        <div class="empty-state">
+                            <span class="icon">🔔</span>
+                            <h3 style="font-size:15px;color:#495057;">No alarms yet</h3>
+                            <p>Click "Add Alarm" to create your first alarm system.</p>
+                        </div>
+                    <?php endif; ?>
+                </div>
+
+                <!-- How it works -->
+                <div class="section" style="border-left:4px solid #cce5ff;background:#f8fbff;">
+                    <div style="font-size:13px;color:#495057;line-height:1.8;">
+                        <strong>ℹ️ How alarms work</strong><br>
+                        <b>1. Manual sound:</b> Click <b>🔊 SOUND</b> on any alarm to play its siren in this browser.<br>
+                        <b>2. Auto-sound rule:</b> When an incident is reported in your zone and no ranger acknowledges it within the configured delay (default 120s), the server-side auto-trigger cron fires all alarms marked <i>auto-sound</i>.<br>
+                        <b>3. Stop:</b> Click <b>⏹️ Stop</b> on any active trigger to silence it. It will also stop automatically after its <i>siren duration</i>.<br>
+                        <b>4. Sound file:</b> Use a preset siren URL or paste your own MP3/OGG link (must be HTTPS).<br>
+                        <b>5. Volume:</b> 0–100%. The browser plays at the volume you set here.
+                    </div>
+                </div>
+
+                <!-- Recent triggers -->
+                <?php if (count($recentTriggers) > 0): ?>
+                <div class="section">
+                    <div class="section-header"><h2>📜 Recent Triggers (<?= count($recentTriggers) ?>)</h2></div>
+                    <?php foreach ($recentTriggers as $t): ?>
+                        <div style="display:flex;align-items:center;gap:12px;padding:10px 12px;background:#fafafa;border-radius:8px;margin-bottom:6px;font-size:13px;border-left:3px solid <?= $t['stopped_at'] ? '#adb5bd' : '#dc3545' ?>;">
+                            <span style="font-size:18px;"><?= $t['stopped_at'] ? '🔕' : '🚨' ?></span>
+                            <div style="flex:1;">
+                                <div style="font-weight:600;color:#0d3b22;"><?= htmlspecialchars($t['alarm_name']) ?></div>
+                                <div style="font-size:11px;color:#6c757d;">
+                                    <?= htmlspecialchars(ucfirst(str_replace('_',' ',$t['triggered_by']))) ?>
+                                    • <?= timeAgo($t['triggered_at']) ?>
+                                    <?php if ($t['duration_seconds']): ?> • ⏱️ <?= (int)$t['duration_seconds'] ?>s<?php endif; ?>
+                                </div>
+                            </div>
+                            <span style="font-size:11px;padding:2px 10px;border-radius:10px;background:<?= $t['stopped_at'] ? '#e9ecef' : '#dc3545' ?>;color:<?= $t['stopped_at'] ? '#495057' : 'white' ?>;font-weight:600;">
+                                <?= $t['stopped_at'] ? 'STOPPED' : 'ACTIVE' ?>
+                            </span>
+                        </div>
+                    <?php endforeach; ?>
+                </div>
+                <?php endif; ?>
+            </div>
+        </main>
+    </div>
+
+    <!-- Modal -->
+    <div class="modal-backdrop" id="alarmModal">
+        <div class="modal">
+            <form method="POST" id="alarmForm">
+                <input type="hidden" name="action" id="formAction" value="create">
+                <input type="hidden" name="alarm_id" id="formAlarmId" value="">
+
+                <div class="modal-header">
+                    <h3 id="modalTitle">➕ Add Alarm</h3>
+                    <button type="button" class="modal-close" onclick="closeModal()">×</button>
+                </div>
+
+                <div class="modal-body">
+                    <div class="form-row">
+                        <div class="form-group">
+                            <label>Alarm Name *</label>
+                            <input type="text" name="alarm_name" id="formAlarmName" required placeholder="e.g. North Gate Siren">
+                        </div>
+                        <div class="form-group">
+                            <label>Alarm Type *</label>
+                            <select name="alarm_type" id="formAlarmType" required>
+                                <option value="siren">🚨 Siren</option>
+                                <option value="bell">🔔 Bell</option>
+                                <option value="strobe">💡 Strobe</option>
+                                <option value="speaker">📢 Speaker</option>
+                                <option value="combined">🚨🔔 Combined</option>
+                            </select>
+                        </div>
+                    </div>
+
+                    <div class="form-group">
+                        <label>Sound File (URL or preset)</label>
+                        <select id="formSoundPreset" onchange="document.getElementById('formSoundUrl').value = this.value;">
+                            <?php foreach ($presetSounds as $url => $label): ?>
+                                <option value="<?= htmlspecialchars($url) ?>"><?= htmlspecialchars($label) ?></option>
+                            <?php endforeach; ?>
+                        </select>
+                        <input type="text" name="sound_url" id="formSoundUrl" placeholder="…or paste a custom MP3/OGG URL" style="margin-top:8px;">
+                        <span class="hint">Must be a direct link to .mp3 or .ogg served over HTTPS.</span>
+                    </div>
+
+                    <div class="form-row three">
+                        <div class="form-group">
+                            <label>Volume (%)</label>
+                            <input type="number" name="sound_volume" id="formSoundVolume" value="80" min="0" max="100">
+                        </div>
+                        <div class="form-group">
+                            <label>Siren Duration (s)</label>
+                            <input type="number" name="siren_duration" id="formSirenDuration" value="180" min="10" max="3600">
+                        </div>
+                        <div class="form-group">
+                            <label>Trigger Delay (s)</label>
+                            <input type="number" name="trigger_delay_seconds" id="formTriggerDelay" value="120" min="30" max="1800">
+                        </div>
+                    </div>
+
+                    <div class="toggle-row" style="border-top:1px solid #f0f0f0;padding-top:14px;">
+                        <div class="toggle-info">
+                            <div class="toggle-label">🔊 Auto-sound on Unacknowledged Incidents</div>
+                            <div class="toggle-desc">Sound this alarm when an incident is not acknowledged within the trigger delay.</div>
+                        </div>
+                        <label class="switch">
+                            <input type="checkbox" name="auto_sound_on_incident" id="formAutoSound" value="1" checked>
+                            <span class="slider"></span>
+                        </label>
+                    </div>
+
+                    <div class="form-row" style="margin-top:14px;">
+                        <div class="form-group">
+                            <label>Latitude</label>
+                            <input type="number" step="0.000001" name="location_lat" id="formLat" placeholder="-13.000000">
+                        </div>
+                        <div class="form-group">
+                            <label>Longitude</label>
+                            <input type="number" step="0.000001" name="location_lng" id="formLng" placeholder="31.500000">
+                        </div>
+                    </div>
+
+                    <div style="margin-top:10px;padding:10px 14px;background:#f0f7f4;border-radius:8px;">
+                        <div style="font-size:12px;color:#495057;">
+                            🎵 <strong>Test:</strong>
+                            <button type="button" class="test-sound-btn" style="margin-left:8px;"
+                                    onclick="playSound(document.getElementById('formSoundUrl').value, document.getElementById('formSoundVolume').value)">
+                                🔊 Play Test Sound
+                            </button>
+                        </div>
+                    </div>
+                </div>
+
+                <div class="modal-footer">
+                    <button type="button" class="btn btn-secondary" onclick="closeModal()">Cancel</button>
+                    <button type="submit" class="btn btn-primary" id="modalSubmitBtn">Save Alarm</button>
+                </div>
+            </form>
+        </div>
+    </div>
+
+    <form method="POST" id="deleteForm" style="display:none;">
+        <input type="hidden" name="action" value="delete">
+        <input type="hidden" name="alarm_id" id="deleteAlarmId">
+    </form>
+
+    <script src="../assets/js/app.js"></script>
+    <script src="../assets/js/transitions.js"></script>
+    <script>
+        const activeSounds = {};
+
+        function playSound(url, volumePercent) {
+            if (!url) return alert('No sound file configured for this alarm.');
+            try {
+                const audio = new Audio(url);
+                audio.loop = true;
+                audio.volume = Math.max(0, Math.min(1, (parseInt(volumePercent) || 80) / 100));
+                const key = 'sound_' + Date.now() + '_' + Math.random();
+                activeSounds[key] = audio;
+                audio.play().catch(err => {
+                    alert('Could not play sound: ' + err.message + '\n\nTip: Browsers block autoplay until you interact with the page. Click once anywhere, then try again.');
+                    delete activeSounds[key];
+                });
+            } catch (err) { alert('Sound error: ' + err.message); }
+        }
+
+        function playSoundFromBtn(btn) {
+            const url = btn.getAttribute('data-sound');
+            const vol = btn.getAttribute('data-volume');
+            playSound(url, vol);
+        }
+
+        function stopAllSounds() {
+            Object.keys(activeSounds).forEach(k => {
+                try { activeSounds[k].pause(); activeSounds[k].currentTime = 0; } catch (e) {}
+                delete activeSounds[k];
+            });
+        }
+
+        // Check for active triggers and play their sound
+        function checkActiveTriggers() {
+            fetch('alarm-check.php', { credentials: 'same-origin' })
+                .then(r => r.json())
+                .then(data => {
+                    if (!data || !data.triggers || !data.triggers.length) {
+                        stopAllSounds();
+                        return;
+                    }
+                    data.triggers.forEach(t => {
+                        if (!t.sound_url) return;
+                        const key = 'trigger_' + t.id;
+                        if (activeSounds[key]) return;
+                        try {
+                            const a = new Audio(t.sound_url);
+                            a.loop = true;
+                            a.volume = Math.max(0, Math.min(1, (parseInt(t.sound_volume) || 80) / 100));
+                            a.play().catch(() => {});
+                            activeSounds[key] = a;
+                        } catch (e) {}
+                    });
+                })
+                .catch(() => {});
+        }
+
+        window.addEventListener('DOMContentLoaded', function () {
+            // Auto-play after manual trigger redirect
+            const urlParams = new URLSearchParams(window.location.search);
+            if (urlParams.get('sound') === '1') {
+                setTimeout(checkActiveTriggers, 400);
+            }
+            checkActiveTriggers();
+            setInterval(checkActiveTriggers, 15000);
+        });
+
+        // Modal
+        function openCreateModal() {
+            document.getElementById('modalTitle').textContent = '➕ Add Alarm';
+            document.getElementById('formAction').value = 'create';
+            document.getElementById('formAlarmId').value = '';
+            document.getElementById('alarmForm').reset();
+            document.getElementById('formAlarmType').value = 'siren';
+            document.getElementById('formSoundPreset').value = '';
+            document.getElementById('formSoundUrl').value = '';
+            document.getElementById('formSoundVolume').value = 80;
+            document.getElementById('formSirenDuration').value = 180;
+            document.getElementById('formTriggerDelay').value = 120;
+            document.getElementById('formAutoSound').checked = true;
+            document.getElementById('modalSubmitBtn').textContent = 'Add Alarm';
+            document.getElementById('alarmModal').classList.add('show');
+        }
+        function openEditModal(a) {
+            document.getElementById('modalTitle').textContent = '✏️ Edit Alarm';
+            document.getElementById('formAction').value = 'update';
+            document.getElementById('formAlarmId').value = a.id;
+            document.getElementById('formAlarmType').value = a.alarm_type || 'siren';
+            document.getElementById('formAlarmName').value = a.alarm_name || '';
+            document.getElementById('formSoundUrl').value = a.sound_url || '';
+            document.getElementById('formSoundVolume').value = a.sound_volume || 80;
+            document.getElementById('formSirenDuration').value = a.siren_duration || 180;
+            document.getElementById('formTriggerDelay').value = a.trigger_delay_seconds || 120;
+            document.getElementById('formAutoSound').checked = parseInt(a.auto_sound_on_incident) === 1;
+            document.getElementById('formLat').value = a.location_lat || '';
+            document.getElementById('formLng').value = a.location_lng || '';
+            document.getElementById('modalSubmitBtn').textContent = 'Save Changes';
+            document.getElementById('alarmModal').classList.add('show');
+        }
+        function closeModal() {
+            document.getElementById('alarmModal').classList.remove('show');
+            stopAllSounds();
+        }
+        function confirmDelete(id, name) {
+            if (confirm('Delete alarm "' + name + '"? This cannot be undone.')) {
+                document.getElementById('deleteAlarmId').value = id;
+                document.getElementById('deleteForm').submit();
+            }
+        }
+        document.getElementById('alarmModal').addEventListener('click', function(e) { if (e.target === this) closeModal(); });
+        document.addEventListener('keydown', function(e) { if (e.key === 'Escape') closeModal(); });
+
+        // Unlock autoplay
+        document.body.addEventListener('click', function once() {
+            try {
+                const silent = new Audio('data:audio/wav;base64,UklGRigAAABXQVZFZm10IBIAAAABAAEARKwAAIhYAQACABAAAABkYXRhAgAAAAEA');
+                silent.volume = 0;
+                silent.play().catch(() => {});
+            } catch (e) {}
+            document.body.removeEventListener('click', once);
+        }, { once: true });
+
+        console.log('✅ Alarm systems page loaded');
+    </script>
+</body>
+</html>

@@ -1,0 +1,574 @@
+<?php
+// ============================================================
+// forgot-password.php
+// Wildlife Sentinel — Password Reset (Step 1 of 2)
+// ------------------------------------------------------------
+// Flow:
+//   1. User enters their email → POST here
+//   2. If email matches an active user, a reset token is
+//      created, stored (hashed) in `password_resets`, and the
+//      user receives a link to reset-password.php?token=...
+//   3. If email does NOT match, we still show the same success
+//      message (prevents user enumeration).
+//
+// HARDENING:
+//   • CSRF token
+//   • IP + email rate limiting
+//   • Timing-safe token handling
+//   • Generic responses
+//   • Audit log
+//
+// EMAIL:
+//   MAIL_ENABLED = false  →  Token is shown on screen ONLY when
+//                            an admin is logged in (dev mode).
+//   MAIL_ENABLED = true   →  Uses ws_send_reset_email() which
+//                            currently uses mail(). Swap for SMTP
+//                            when ready.
+// ============================================================
+
+// ------------------------------------------------------------
+// CONFIG
+// ------------------------------------------------------------
+define('MAIL_ENABLED', false);      // ← set true when mail is configured
+define('RESET_TTL_MIN', 60);        // minutes a token stays valid
+define('DEV_SHOW_LINK', true);      // ← when true AND admin is logged in, show link on screen
+
+// ------------------------------------------------------------
+// DEBUG
+// ------------------------------------------------------------
+$wsDebugEnv = getenv('WS_DEBUG');
+$DEBUG_MODE = ($wsDebugEnv === '1');
+
+if ($DEBUG_MODE) {
+    error_reporting(E_ALL);
+    ini_set('display_errors', '1');
+} else {
+    error_reporting(E_ALL);
+    ini_set('display_errors', '0');
+    ini_set('log_errors', '1');
+}
+
+// ------------------------------------------------------------
+// BOOT
+// ------------------------------------------------------------
+require_once __DIR__ . '/config/database.php';
+require_once __DIR__ . '/includes/functions.php';
+
+// ------------------------------------------------------------
+// LOGO
+// ------------------------------------------------------------
+$logoUrl = 'https://encrypted-tbn0.gstatic.com/images?q=tbn:ANd9GcSNUo8sFW1IUxMnFDN_ZE2dSEegfrRcFqyzgZfg1L2I1g&s';
+
+// ------------------------------------------------------------
+// CSRF
+// ------------------------------------------------------------
+if (empty($_SESSION['csrf_token'])) {
+    $_SESSION['csrf_token'] = bin2hex(random_bytes(32));
+}
+$csrf = $_SESSION['csrf_token'];
+
+// ------------------------------------------------------------
+// ENSURE password_resets TABLE EXISTS
+// ------------------------------------------------------------
+try {
+    $pdo = getDB();
+    $pdo->exec("
+        CREATE TABLE IF NOT EXISTS password_resets (
+            id INT(11) AUTO_INCREMENT PRIMARY KEY,
+            user_id INT(11) NOT NULL,
+            email VARCHAR(150) NOT NULL,
+            token_hash VARCHAR(255) NOT NULL,
+            ip_address VARCHAR(45) NULL,
+            user_agent VARCHAR(255) NULL,
+            created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+            expires_at DATETIME NOT NULL,
+            used_at DATETIME NULL,
+            INDEX idx_token (token_hash),
+            INDEX idx_user (user_id),
+            INDEX idx_expires (expires_at)
+        ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
+    ");
+} catch (PDOException $e) {
+    error_log('[WS-FORGOT] create table: ' . $e->getMessage());
+}
+
+// ------------------------------------------------------------
+// HELPERS
+// ------------------------------------------------------------
+function ws_client_ip(): string {
+    foreach (['HTTP_CF_CONNECTING_IP','HTTP_X_FORWARDED_FOR','HTTP_X_REAL_IP','REMOTE_ADDR'] as $k) {
+        if (!empty($_SERVER[$k])) {
+            return trim(explode(',', (string)$_SERVER[$k])[0]);
+        }
+    }
+    return '0.0.0.0';
+}
+
+function ws_check_csrf(): bool {
+    return isset($_POST['csrf'], $_SESSION['csrf_token'])
+        && hash_equals($_SESSION['csrf_token'], (string)$_POST['csrf']);
+}
+
+function ws_base_url(): string {
+    // Works on XAMPP at /wildlife-sentinel/ and on hosted deployments
+    $scheme = (!empty($_SERVER['HTTPS']) && $_SERVER['HTTPS'] !== 'off') ? 'https' : 'http';
+    $host   = $_SERVER['HTTP_HOST'] ?? 'localhost';
+    $dir    = rtrim(dirname($_SERVER['PHP_SELF'] ?? '/'), '/\\');
+    // Go up one level if we're inside /admin or a subfolder
+    return $scheme . '://' . $host . $dir;
+}
+
+function ws_send_reset_email(string $toEmail, string $toName, string $resetLink, int $ttlMinutes): bool {
+    if (!MAIL_ENABLED) {
+        error_log("[WS-FORGOT] MAIL_ENABLED=false — reset link for {$toEmail}: {$resetLink}");
+        return true;
+    }
+    $subject = 'Wildlife Sentinel — Password Reset';
+    $body    = "Hello " . ($toName ?: 'there') . ",\n\n"
+             . "Someone requested a password reset for your Wildlife Sentinel account.\n\n"
+             . "If this was you, click the link below within {$ttlMinutes} minutes:\n\n"
+             . $resetLink . "\n\n"
+             . "If you did NOT request this, you can safely ignore this email. "
+             . "Your password will not change until you use the link.\n\n"
+             . "— Wildlife Sentinel";
+
+    $headers = "From: Wildlife Sentinel <no-reply@wildlife-sentinel.zm>\r\n"
+             . "Reply-To: support@wildlife-sentinel.zm\r\n"
+             . "X-Mailer: PHP/" . phpversion();
+
+    try {
+        return @mail($toEmail, $subject, $body, $headers);
+    } catch (Throwable $e) {
+        error_log('[WS-FORGOT] mail() failed: ' . $e->getMessage());
+        return false;
+    }
+}
+
+// ------------------------------------------------------------
+// HANDLE POST
+// ------------------------------------------------------------
+$error       = '';
+$success     = '';
+$debugInfo   = [];
+$devResetLink = '';
+
+$emailInput = '';
+
+if ($_SERVER['REQUEST_METHOD'] === 'POST') {
+    if (!ws_check_csrf()) {
+        $error = 'Session expired. Please reload the page and try again.';
+    } else {
+        $emailInput = strtolower(trim((string)($_POST['email'] ?? '')));
+        $ip         = ws_client_ip();
+
+        // ---- Rate limits (IP + email) ----
+        $rlKeys = [
+            'forgot_ip_'    . $ip,
+            'forgot_email_' . $emailInput,
+        ];
+        $rateLimited = false;
+        foreach ($rlKeys as $k) {
+            if (!checkRateLimit($k, 5, 600)) { // 5 requests / 10 min
+                $rateLimited = true;
+                break;
+            }
+        }
+
+        if ($rateLimited) {
+            $error = 'Too many reset attempts. Please wait 10 minutes and try again.';
+        } elseif ($emailInput === '' || !validateEmail($emailInput)) {
+            // Still generic-ish, but a visible hint helps real users
+            $error = 'Please enter a valid email address.';
+        } else {
+            try {
+                // Look up active user
+                $stmt = $pdo->prepare("
+                    SELECT id, full_name, email, is_active
+                    FROM users
+                    WHERE LOWER(email) = LOWER(?)
+                    LIMIT 1
+                ");
+                $stmt->execute([$emailInput]);
+                $user = $stmt->fetch();
+
+                if ($user && (int)$user['is_active'] === 1) {
+                    // Invalidate any outstanding unused tokens for this user
+                    try {
+                        $pdo->prepare("
+                            UPDATE password_resets
+                            SET used_at = NOW()
+                            WHERE user_id = ? AND used_at IS NULL
+                        ")->execute([(int)$user['id']]);
+                    } catch (PDOException $e) { /* non-fatal */ }
+
+                    // Generate token
+                    $rawToken  = bin2hex(random_bytes(32));   // 64-char hex
+                    $tokenHash = hash('sha256', $rawToken);
+                    $expires   = date('Y-m-d H:i:s', time() + RESET_TTL_MIN * 60);
+
+                    $ins = $pdo->prepare("
+                        INSERT INTO password_resets
+                            (user_id, email, token_hash, ip_address, user_agent, created_at, expires_at)
+                        VALUES (?, ?, ?, ?, ?, NOW(), ?)
+                    ");
+                    $ins->execute([
+                        (int)$user['id'],
+                        (string)$user['email'],
+                        $tokenHash,
+                        $ip,
+                        substr((string)($_SERVER['HTTP_USER_AGENT'] ?? ''), 0, 255),
+                        $expires,
+                    ]);
+
+                    // Build link
+                    $resetLink = ws_base_url() . '/reset-password.php?token=' . $rawToken;
+
+                    // Send (or just log)
+                    $ok = ws_send_reset_email(
+                        (string)$user['email'],
+                        (string)$user['full_name'],
+                        $resetLink,
+                        RESET_TTL_MIN
+                    );
+
+                    try {
+                        logAudit((int)$user['id'], 'password_reset_requested', [
+                            'email' => $user['email'],
+                            'ip'    => $ip,
+                            'sent'  => $ok ? 1 : 0,
+                        ]);
+                    } catch (Throwable $e) { /* non-fatal */ }
+
+                    // Dev convenience: show link if admin is signed in
+                    if (DEV_SHOW_LINK && isLoggedIn() && hasRole('admin')) {
+                        $devResetLink = $resetLink;
+                    }
+
+                    $success = 'If that email is registered, you will receive a reset link shortly. '
+                             . 'Check your inbox and spam folder. The link expires in '
+                             . RESET_TTL_MIN . ' minutes.';
+                } else {
+                    // Do NOT reveal whether the email exists
+                    $success = 'If that email is registered, you will receive a reset link shortly. '
+                             . 'Check your inbox and spam folder. The link expires in '
+                             . RESET_TTL_MIN . ' minutes.';
+
+                    // Log attempt (but no user_id)
+                    try {
+                        logAudit(0, 'password_reset_requested', [
+                            'email' => $emailInput,
+                            'ip'    => $ip,
+                            'found' => 0,
+                        ]);
+                    } catch (Throwable $e) { /* non-fatal */ }
+                }
+            } catch (PDOException $e) {
+                error_log('[WS-FORGOT] ' . $e->getMessage());
+                $error = 'Something went wrong. Please try again in a moment.';
+            }
+        }
+    }
+}
+?>
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+    <meta name="theme-color" content="#0d3b22">
+    <title>Forgot Password - Wildlife Sentinel</title>
+    <link rel="icon" href="<?= htmlspecialchars($logoUrl, ENT_QUOTES) ?>">
+    <link href="https://fonts.googleapis.com/css2?family=Playfair+Display:wght@400;700;800&family=Inter:wght@300;400;600;700&display=swap" rel="stylesheet">
+
+    <style>
+        * { margin: 0; padding: 0; box-sizing: border-box; }
+        body {
+            font-family: 'Inter', -apple-system, BlinkMacSystemFont, sans-serif;
+            min-height: 100vh; min-height: 100dvh;
+            background: linear-gradient(135deg, #0a1a0f 0%, #1a5c3a 50%, #0d3b22 100%);
+            display: flex; align-items: center; justify-content: center;
+            padding: 16px; position: relative; overflow: hidden;
+        }
+        body::before {
+            content: '';
+            position: absolute; inset: 0;
+            background:
+                radial-gradient(circle at 20% 50%, rgba(74,222,128,0.05) 0%, transparent 50%),
+                radial-gradient(circle at 80% 50%, rgba(74,222,128,0.05) 0%, transparent 50%);
+            z-index: 0;
+        }
+
+        .animals-bg { position: fixed; inset: 0; z-index: 0; overflow: hidden; pointer-events: none; }
+        .animal { position: absolute; font-size: 40px; animation: floatAnimal linear infinite; opacity: 0.12; }
+        .animal:nth-child(1)  { top: 5%;  left: 5%;    font-size: 50px; animation-duration: 25s; }
+        .animal:nth-child(2)  { top: 15%; right: 10%;  font-size: 35px; animation-duration: 20s; animation-delay: 2s; }
+        .animal:nth-child(3)  { bottom: 20%; left: 8%; font-size: 45px; animation-duration: 28s; animation-delay: 4s; }
+        .animal:nth-child(4)  { bottom: 30%; right: 5%;font-size: 30px; animation-duration: 22s; animation-delay: 1s; }
+        .animal:nth-child(5)  { top: 50%; left: 15%;   font-size: 25px; animation-duration: 18s; animation-delay: 3s; }
+        .animal:nth-child(6)  { top: 60%; right: 15%;  font-size: 35px; animation-duration: 26s; animation-delay: 5s; }
+        .animal:nth-child(7)  { top: 30%; left: 50%;   font-size: 28px; animation-duration: 30s; animation-delay: 2s; }
+        .animal:nth-child(8)  { bottom: 10%; left: 50%;font-size: 32px; animation-duration: 24s; animation-delay: 4s; }
+
+        @keyframes floatAnimal {
+            0%   { transform: translate(0,0) rotate(0deg); opacity: 0.1; }
+            10%  { opacity: 0.2; }
+            25%  { transform: translate(100px,-50px) rotate(10deg); opacity: 0.15; }
+            50%  { transform: translate(200px,30px) rotate(-5deg); opacity: 0.2; }
+            75%  { transform: translate(100px,50px) rotate(8deg); opacity: 0.15; }
+            90%  { opacity: 0.1; }
+            100% { transform: translate(0,0) rotate(0deg); opacity: 0.1; }
+        }
+
+        .wrapper { position: relative; z-index: 1; width: 100%; max-width: 460px; }
+
+        .box {
+            background: rgba(255,255,255,0.06);
+            backdrop-filter: blur(20px);
+            -webkit-backdrop-filter: blur(20px);
+            border-radius: 24px;
+            padding: 32px 28px;
+            border: 1px solid rgba(255,255,255,0.08);
+            box-shadow: 0 20px 60px rgba(0,0,0,0.5);
+            animation: slideUp 0.5s ease;
+            position: relative;
+        }
+        @keyframes slideUp {
+            from { opacity: 0; transform: translateY(24px); }
+            to   { opacity: 1; transform: translateY(0); }
+        }
+        .box::before {
+            content: '';
+            position: absolute; top: -2px; left: -2px; right: -2px; bottom: -2px;
+            background: linear-gradient(45deg, #4ade80, #22d3ee, #4ade80, #22d3ee);
+            background-size: 400% 400%;
+            border-radius: 26px; z-index: -1;
+            animation: gradientBorder 6s ease infinite;
+            opacity: 0.25;
+        }
+        @keyframes gradientBorder {
+            0%   { background-position: 0% 50%; }
+            50%  { background-position: 100% 50%; }
+            100% { background-position: 0% 50%; }
+        }
+
+        .header { text-align: center; margin-bottom: 22px; }
+        .header .logo {
+            width: 64px; height: 64px;
+            display: inline-flex; align-items: center; justify-content: center;
+            margin-bottom: 12px; border-radius: 18px;
+            background: linear-gradient(135deg, rgba(74,222,128,0.15), rgba(34,211,238,0.1));
+            border: 2px solid rgba(74,222,128,0.25);
+            box-shadow: 0 8px 30px rgba(74,222,128,0.15);
+            overflow: hidden;
+        }
+        .header .logo img { width: 100%; height: 100%; object-fit: cover; display: block; }
+        .header h1 {
+            font-family: 'Playfair Display', serif;
+            font-size: 24px; font-weight: 800; color: white;
+            letter-spacing: -0.5px;
+        }
+        .header h1 .highlight {
+            background: linear-gradient(135deg, #4ade80, #22d3ee);
+            -webkit-background-clip: text;
+            -webkit-text-fill-color: transparent;
+        }
+        .header p { color: rgba(255,255,255,0.5); font-size: 13px; margin-top: 6px; line-height: 1.5; }
+
+        .alert {
+            padding: 12px 16px;
+            border-radius: 10px;
+            margin-bottom: 14px;
+            font-size: 13px;
+            line-height: 1.55;
+        }
+        .alert-danger  { background: rgba(220,53,69,0.2);  border: 1px solid rgba(220,53,69,0.35);  color: #f8d7da; }
+        .alert-success { background: rgba(40,167,69,0.2);  border: 1px solid rgba(40,167,69,0.35);  color: #d4edda; }
+        .alert-info    { background: rgba(2,136,209,0.15); border: 1px solid rgba(2,136,209,0.3);   color: #b3e5fc; font-size: 12.5px; }
+
+        .form-group { margin-bottom: 16px; }
+        .form-group label {
+            display: block;
+            font-size: 12px;
+            font-weight: 600;
+            color: rgba(255,255,255,0.72);
+            margin-bottom: 6px;
+        }
+        .input-wrap { position: relative; }
+        .input-wrap .input-icon {
+            position: absolute;
+            left: 12px; top: 50%; transform: translateY(-50%);
+            font-size: 16px;
+            opacity: 0.5;
+            pointer-events: none;
+        }
+        .form-control {
+            width: 100%;
+            padding: 12px 14px 12px 40px;
+            border: 2px solid rgba(255,255,255,0.1);
+            border-radius: 10px;
+            font-size: 15px;
+            background: rgba(255,255,255,0.06);
+            color: white;
+            transition: all 0.25s;
+            font-family: inherit;
+            min-height: 46px;
+            -webkit-appearance: none;
+        }
+        .form-control::placeholder { color: rgba(255,255,255,0.3); }
+        .form-control:focus {
+            outline: none;
+            border-color: #4ade80;
+            background: rgba(255,255,255,0.09);
+            box-shadow: 0 0 0 4px rgba(74,222,128,0.12);
+        }
+
+        .btn {
+            width: 100%;
+            padding: 12px;
+            border: none;
+            border-radius: 10px;
+            font-size: 15px;
+            font-weight: 600;
+            cursor: pointer;
+            transition: all 0.25s;
+            font-family: inherit;
+            display: flex; align-items: center; justify-content: center;
+            gap: 8px;
+            min-height: 48px;
+            text-decoration: none;
+            color: white;
+        }
+        .btn-primary {
+            background: linear-gradient(135deg, #1a5c3a, #2d8a4e);
+            box-shadow: 0 4px 25px rgba(26,92,58,0.35);
+        }
+        .btn-primary:hover {
+            transform: translateY(-2px);
+            box-shadow: 0 8px 40px rgba(26,92,58,0.5);
+        }
+        .btn-secondary {
+            background: rgba(255,255,255,0.06);
+            border: 1px solid rgba(255,255,255,0.14);
+            color: rgba(255,255,255,0.9);
+        }
+        .btn-secondary:hover {
+            background: rgba(255,255,255,0.12);
+            border-color: rgba(255,255,255,0.24);
+        }
+
+        .dev-link-box {
+            background: rgba(255,193,7,0.12);
+            border: 1px dashed rgba(255,193,7,0.4);
+            border-radius: 10px;
+            padding: 12px 14px;
+            margin-top: 14px;
+            font-size: 12px;
+            color: #ffe082;
+            word-break: break-all;
+            line-height: 1.6;
+        }
+        .dev-link-box strong { color: #ffd54f; display: block; margin-bottom: 6px; }
+        .dev-link-box a { color: #4ade80; text-decoration: underline; }
+
+        .footer {
+            text-align: center;
+            margin-top: 20px;
+            padding-top: 16px;
+            border-top: 1px solid rgba(255,255,255,0.08);
+            font-size: 12px;
+            color: rgba(255,255,255,0.4);
+        }
+        .footer a {
+            color: #4ade80;
+            text-decoration: none;
+            font-weight: 600;
+        }
+        .footer a:hover { text-decoration: underline; }
+
+        @media (max-width: 480px) {
+            .box { padding: 24px 20px; border-radius: 18px; }
+            .header h1 { font-size: 21px; }
+            .header .logo { width: 56px; height: 56px; }
+            input, select, textarea { font-size: 16px !important; }
+            .animal { font-size: 26px !important; opacity: 0.08; }
+        }
+    </style>
+</head>
+<body>
+    <div class="animals-bg">
+        <span class="animal">🦁</span>
+        <span class="animal">🐘</span>
+        <span class="animal">🦒</span>
+        <span class="animal">🦏</span>
+        <span class="animal">🐆</span>
+        <span class="animal">🦛</span>
+        <span class="animal">🦅</span>
+        <span class="animal">🦓</span>
+    </div>
+
+    <div class="wrapper">
+        <div class="box">
+            <div class="header">
+                <span class="logo">
+                    <img src="<?= htmlspecialchars($logoUrl, ENT_QUOTES) ?>" alt="Wildlife Sentinel">
+                </span>
+                <h1>Forgot <span class="highlight">Password</span></h1>
+                <p>
+                    Enter your email address and we'll send you a link to reset it.
+                    The link expires in <?= RESET_TTL_MIN ?> minutes.
+                </p>
+            </div>
+
+            <?php if ($error): ?>
+                <div class="alert alert-danger">❌ <?= htmlspecialchars($error) ?></div>
+            <?php endif; ?>
+
+            <?php if ($success): ?>
+                <div class="alert alert-success">✅ <?= htmlspecialchars($success) ?></div>
+            <?php endif; ?>
+
+            <?php if (!$success): ?>
+                <form method="POST" autocomplete="off">
+                    <input type="hidden" name="csrf" value="<?= htmlspecialchars($csrf, ENT_QUOTES) ?>">
+
+                    <div class="form-group">
+                        <label for="email">Email Address</label>
+                        <div class="input-wrap">
+                            <span class="input-icon">📧</span>
+                            <input type="email"
+                                   name="email"
+                                   id="email"
+                                   class="form-control"
+                                   placeholder="you@example.com"
+                                   required
+                                   maxlength="150"
+                                   autocomplete="email"
+                                   value="<?= htmlspecialchars($emailInput) ?>">
+                        </div>
+                    </div>
+
+                    <button type="submit" class="btn btn-primary">✉️ Send Reset Link</button>
+                </form>
+            <?php else: ?>
+                <a href="login.php" class="btn btn-secondary" style="margin-top:8px;">← Back to Sign In</a>
+            <?php endif; ?>
+
+            <?php if ($devResetLink): ?>
+                <div class="dev-link-box">
+                    <strong>🧪 DEV MODE — Reset link (admin only)</strong>
+                    MAIL_ENABLED is off. Click the link below to reset the password:<br>
+                    <a href="<?= htmlspecialchars($devResetLink, ENT_QUOTES) ?>">
+                        <?= htmlspecialchars($devResetLink) ?>
+                    </a>
+                </div>
+            <?php endif; ?>
+
+            <div class="footer">
+                Remembered it? <a href="login.php">Sign in</a>
+                &nbsp;·&nbsp;
+                <a href="index.php">Home</a>
+            </div>
+        </div>
+    </div>
+</body>
+</html>
