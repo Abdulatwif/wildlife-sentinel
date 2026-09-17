@@ -1,4 +1,7 @@
 ﻿<?php
+// Start output buffering immediately to prevent "headers already sent" issues
+if (!ob_get_level()) { ob_start(); }
+
 // ============================================================
 // config/database.php
 // Wildlife Sentinel — Database connection & core helpers
@@ -37,13 +40,15 @@ if (!defined('AI_SERVICE_URL')) {
 }
 
 // ------------------------------------------------------------
-// SESSION
+// SESSION — started here only; functions.php checks status too
 // ------------------------------------------------------------
 if (session_status() === PHP_SESSION_NONE) {
     $secure = (
         (!empty($_SERVER['HTTPS']) && $_SERVER['HTTPS'] !== 'off')
         || (($_SERVER['HTTP_X_FORWARDED_PROTO'] ?? '') === 'https')
     );
+    // Suppress the warning — on Render the HTTPS header may arrive
+    // after some output buffer flush; the @ prevents the visible warning.
     @session_set_cookie_params([
         'lifetime' => 0,
         'path'     => '/',
@@ -51,7 +56,7 @@ if (session_status() === PHP_SESSION_NONE) {
         'httponly' => true,
         'samesite' => 'Lax',
     ]);
-    session_start();
+    @session_start();
 }
 
 // ------------------------------------------------------------
