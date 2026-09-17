@@ -3,56 +3,51 @@ $pass = getenv('DB_PASSWORD') ?: '';
 $ref  = 'vpgytgumxyravtzrahaf';
 
 echo "<pre>";
-echo "Testing Supabase connections...\n\n";
+echo "Testing all possible Supabase pooler hosts...\n\n";
 
-// Resolve IPv4 address of the direct host
-$directHost = "db.{$ref}.supabase.co";
-$ipv4 = null;
-$dnsRecords = dns_get_record($directHost, DNS_A);
-if (!empty($dnsRecords)) {
-    $ipv4 = $dnsRecords[0]['ip'];
-    echo "Resolved {$directHost} IPv4: {$ipv4}\n\n";
-} else {
-    echo "Could not resolve IPv4 for {$directHost}\n\n";
-}
-
-$attempts = [
-    'Direct IPv4 address + sslmode=require' => [
-        'dsn'  => $ipv4 ? "pgsql:host={$ipv4};port=5432;dbname=postgres;sslmode=require" : null,
-        'user' => 'postgres',
-    ],
-    'Direct IPv4 address + sslmode=disable' => [
-        'dsn'  => $ipv4 ? "pgsql:host={$ipv4};port=5432;dbname=postgres;sslmode=disable" : null,
-        'user' => 'postgres',
-    ],
-    'Pooler port 6543 sslmode=require' => [
-        'dsn'  => "pgsql:host=aws-0-eu-west-1.pooler.supabase.com;port=6543;dbname=postgres;sslmode=require",
-        'user' => "postgres.{$ref}",
-    ],
-    'Pooler port 5432 sslmode=require' => [
-        'dsn'  => "pgsql:host=aws-0-eu-west-1.pooler.supabase.com;port=5432;dbname=postgres;sslmode=require",
-        'user' => "postgres.{$ref}",
-    ],
+$hosts = [
+    "aws-0-eu-west-1.pooler.supabase.com",
+    "aws-0-eu-west-2.pooler.supabase.com",
+    "eu-west-1.pooler.supabase.com",
+    "pooler.supabase.com",
 ];
 
-foreach ($attempts as $label => $cfg) {
-    if (!$cfg['dsn']) { echo "--- {$label} ---\nSKIPPED (no IPv4)\n\n"; continue; }
-    echo "--- {$label} ---\n";
-    echo "DSN : {$cfg['dsn']}\n";
-    echo "User: {$cfg['user']}\n";
-    try {
-        $pdo = new PDO($cfg['dsn'], $cfg['user'], $pass, [
-            PDO::ATTR_ERRMODE => PDO::ERRMODE_EXCEPTION,
-            PDO::ATTR_TIMEOUT => 8,
-        ]);
-        echo "✅ SUCCESS\n";
-        $row = $pdo->query("SELECT version()")->fetch();
-        echo "Version: " . $row[0] . "\n\n";
-        echo "=== USE THIS CONNECTION ===\n";
-        echo "Host: " . parse_url($cfg['dsn'], PHP_URL_HOST) . "\n";
-        break;
-    } catch (Exception $e) {
-        echo "❌ FAILED: " . $e->getMessage() . "\n\n";
+$ports = [6543, 5432];
+$users = [
+    "postgres.{$ref}",
+    "postgres",
+];
+
+foreach ($hosts as $host) {
+    foreach ($ports as $port) {
+        foreach ($users as $user) {
+            $dsn = "pgsql:host={$host};port={$port};dbname=postgres;sslmode=require";
+            echo "Host: {$host}:{$port} User: {$user}\n";
+            try {
+                $pdo = new PDO($dsn, $user, $pass, [
+                    PDO::ATTR_ERRMODE => PDO::ERRMODE_EXCEPTION,
+                    PDO::ATTR_TIMEOUT => 5,
+                ]);
+                echo "✅ SUCCESS!\n";
+                echo "=== WORKING CONFIG ===\n";
+                echo "DB_HOST: {$host}\n";
+                echo "DB_PORT: {$port}\n";
+                echo "DB_USER: {$user}\n";
+                echo "DB_NAME: postgres\n";
+                echo "DB_SSLMODE: require\n";
+                exit;
+            } catch (Exception $e) {
+                $msg = $e->getMessage();
+                // Shorten error
+                if (strpos($msg, 'FATAL') !== false) {
+                    preg_match('/FATAL.*/', $msg, $m);
+                    echo "❌ " . ($m[0] ?? $msg) . "\n";
+                } else {
+                    echo "❌ " . substr($msg, 0, 80) . "\n";
+                }
+            }
+        }
     }
 }
+echo "\nAll attempts failed.\n";
 echo "</pre>";
