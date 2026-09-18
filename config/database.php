@@ -1,4 +1,4 @@
-﻿<?php
+<?php
 if (!ob_get_level()) { ob_start(); }
 
 // ============================================================
@@ -12,10 +12,10 @@ if (!ob_get_level()) { ob_start(); }
 //   DB_SSLMODE  = require
 // ============================================================
 
-if (!defined('DB_HOST'))    define('DB_HOST',    getenv('DB_HOST')     ?: 'localhost');
-if (!defined('DB_PORT'))    define('DB_PORT',    getenv('DB_PORT')     ?: '5432');
+if (!defined('DB_HOST'))    define('DB_HOST',    getenv('DB_HOST')     ?: 'aws-1-eu-west-1.pooler.supabase.com');
+if (!defined('DB_PORT'))    define('DB_PORT',    getenv('DB_PORT')     ?: '6543');
 if (!defined('DB_NAME'))    define('DB_NAME',    getenv('DB_NAME')     ?: 'postgres');
-if (!defined('DB_USER'))    define('DB_USER',    getenv('DB_USER')     ?: 'postgres');
+if (!defined('DB_USER'))    define('DB_USER',    getenv('DB_USER')     ?: 'postgres.vpgytgumxyravtzrahaf');
 if (!defined('DB_PASS'))    define('DB_PASS',    getenv('DB_PASSWORD') ?: '');
 if (!defined('DB_SSLMODE')) define('DB_SSLMODE', getenv('DB_SSLMODE')  ?: 'require');
 
@@ -37,7 +37,7 @@ if (!function_exists('getDB')) {
         $dsn = 'pgsql:host=' . DB_HOST
              . ';port='      . DB_PORT
              . ';dbname='    . DB_NAME
-             . ';sslmode='   . DB_SSLMODE
+\             . ';sslmode='   . DB_SSLMODE
              . ';options=--client_encoding=UTF8';
 
         try {
