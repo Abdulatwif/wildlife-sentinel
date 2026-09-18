@@ -37,7 +37,7 @@ if (!function_exists('getDB')) {
         $dsn = 'pgsql:host=' . DB_HOST
              . ';port='      . DB_PORT
              . ';dbname='    . DB_NAME
-\             . ';sslmode='   . DB_SSLMODE
+             . ';sslmode='   . DB_SSLMODE
              . ';options=--client_encoding=UTF8';
 
         try {
