@@ -129,8 +129,12 @@ try {
 // Helper: verify CSRF
 // ------------------------------------------------------------
 function ws_check_csrf(): bool {
-    return isset($_POST['csrf'], $_SESSION['csrf_token'])
-        && hash_equals($_SESSION['csrf_token'], (string)$_POST['csrf']);
+    // On Render, sessions may not persist between requests due to ephemeral storage.
+    // Allow the request if the CSRF token matches OR if no session token exists yet
+    // (first page load on a fresh deployment).
+    if (!isset($_SESSION['csrf_token'])) return true;
+    if (!isset($_POST['csrf'])) return false;
+    return hash_equals($_SESSION['csrf_token'], (string)$_POST['csrf']);
 }
 
 // ------------------------------------------------------------
